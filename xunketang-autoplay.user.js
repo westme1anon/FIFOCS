@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         讯飞智课自动刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      2.0
+// @version      2.1
 // @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
 // @author       kumiko
 // @match        *://*.fifedu.com/*
@@ -29,6 +29,344 @@
         debug: true,
     };
 
+    // ========== 悬浮窗控制状态 ==========
+    let isRunning = false;
+    let controlPanel = null;
+    let statusText = null;
+    let progressBar = null;
+    let progressText = null;
+    let startBtn = null;
+    let stopBtn = null;
+    let logContainer = null;
+    let mainInterval = null;
+
+    // ========== 悬浮窗UI ==========
+    function createControlPanel() {
+        const panel = document.createElement('div');
+        panel.id = 'xunketang-autoplay-panel';
+        panel.innerHTML = `
+            <style>
+                #xunketang-autoplay-panel {
+                    position: fixed;
+                    top: 20px;
+                    right: 20px;
+                    width: 320px;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    border-radius: 12px;
+                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+                    z-index: 999999;
+                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+                    color: #fff;
+                    overflow: hidden;
+                    transition: all 0.3s ease;
+                }
+                #xunketang-autoplay-panel.minimized {
+                    width: 60px;
+                    height: 60px;
+                    border-radius: 50%;
+                    cursor: pointer;
+                }
+                #xunketang-autoplay-panel.minimized .panel-content {
+                    display: none;
+                }
+                #xunketang-autoplay-panel.minimized .minimized-icon {
+                    display: flex;
+                }
+                .minimized-icon {
+                    display: none;
+                    width: 100%;
+                    height: 100%;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 24px;
+                }
+                .panel-header {
+                    display: flex;
+                    justify-content: space-between;
+                    align-items: center;
+                    padding: 12px 16px;
+                    background: rgba(0,0,0,0.2);
+                    cursor: move;
+                }
+                .panel-title {
+                    font-size: 14px;
+                    font-weight: 600;
+                }
+                .panel-controls {
+                    display: flex;
+                    gap: 8px;
+                }
+                .panel-btn {
+                    width: 24px;
+                    height: 24px;
+                    border: none;
+                    border-radius: 50%;
+                    cursor: pointer;
+                    display: flex;
+                    align-items: center;
+                    justify-content: center;
+                    font-size: 12px;
+                    transition: transform 0.2s;
+                }
+                .panel-btn:hover {
+                    transform: scale(1.1);
+                }
+                .btn-minimize {
+                    background: #ffd93d;
+                    color: #333;
+                }
+                .btn-close {
+                    background: #ff6b6b;
+                    color: #fff;
+                }
+                .panel-content {
+                    padding: 16px;
+                }
+                .status-section {
+                    margin-bottom: 12px;
+                }
+                .status-label {
+                    font-size: 11px;
+                    opacity: 0.8;
+                    margin-bottom: 4px;
+                }
+                .status-value {
+                    font-size: 13px;
+                    font-weight: 500;
+                }
+                .progress-section {
+                    margin-bottom: 16px;
+                }
+                .progress-bar-container {
+                    width: 100%;
+                    height: 8px;
+                    background: rgba(255,255,255,0.2);
+                    border-radius: 4px;
+                    overflow: hidden;
+                    margin-top: 6px;
+                }
+                .progress-bar-fill {
+                    height: 100%;
+                    background: linear-gradient(90deg, #4ade80, #22c55e);
+                    border-radius: 4px;
+                    transition: width 0.3s ease;
+                    width: 0%;
+                }
+                .progress-info {
+                    display: flex;
+                    justify-content: space-between;
+                    margin-top: 4px;
+                    font-size: 11px;
+                    opacity: 0.9;
+                }
+                .button-section {
+                    display: flex;
+                    gap: 10px;
+                    margin-bottom: 12px;
+                }
+                .action-btn {
+                    flex: 1;
+                    padding: 10px;
+                    border: none;
+                    border-radius: 8px;
+                    font-size: 13px;
+                    font-weight: 600;
+                    cursor: pointer;
+                    transition: all 0.2s;
+                }
+                .action-btn:hover {
+                    transform: translateY(-2px);
+                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+                }
+                .action-btn:disabled {
+                    opacity: 0.5;
+                    cursor: not-allowed;
+                    transform: none;
+                }
+                .btn-start {
+                    background: linear-gradient(135deg, #4ade80, #22c55e);
+                    color: #fff;
+                }
+                .btn-stop {
+                    background: linear-gradient(135deg, #f87171, #ef4444);
+                    color: #fff;
+                }
+                .log-section {
+                    background: rgba(0,0,0,0.2);
+                    border-radius: 8px;
+                    padding: 10px;
+                    max-height: 120px;
+                    overflow-y: auto;
+                }
+                .log-title {
+                    font-size: 11px;
+                    opacity: 0.8;
+                    margin-bottom: 6px;
+                }
+                .log-entry {
+                    font-size: 11px;
+                    line-height: 1.4;
+                    padding: 2px 0;
+                    border-bottom: 1px solid rgba(255,255,255,0.1);
+                }
+                .log-entry:last-child {
+                    border-bottom: none;
+                }
+                .log-time {
+                    opacity: 0.6;
+                    margin-right: 6px;
+                }
+            </style>
+            <div class="minimized-icon">▶</div>
+            <div class="panel-content">
+                <div class="panel-header">
+                    <span class="panel-title">🎓 讯飞智课助手</span>
+                    <div class="panel-controls">
+                        <button class="panel-btn btn-minimize" title="最小化">−</button>
+                        <button class="panel-btn btn-close" title="关闭">×</button>
+                    </div>
+                </div>
+                <div class="status-section">
+                    <div class="status-label">运行状态</div>
+                    <div class="status-value" id="autoplay-status">已停止</div>
+                </div>
+                <div class="progress-section">
+                    <div class="status-label">当前进度</div>
+                    <div class="progress-bar-container">
+                        <div class="progress-bar-fill" id="autoplay-progress-bar"></div>
+                    </div>
+                    <div class="progress-info">
+                        <span id="autoplay-progress-text">等待开始...</span>
+                        <span id="autoplay-progress-percent">0%</span>
+                    </div>
+                </div>
+                <div class="button-section">
+                    <button class="action-btn btn-start" id="autoplay-start-btn">▶ 开始</button>
+                    <button class="action-btn btn-stop" id="autoplay-stop-btn" disabled>⏹ 停止</button>
+                </div>
+                <div class="log-section">
+                    <div class="log-title">📋 运行日志</div>
+                    <div id="autoplay-log-container"></div>
+                </div>
+            </div>
+        `;
+
+        document.body.appendChild(panel);
+        controlPanel = panel;
+        statusText = document.getElementById('autoplay-status');
+        progressBar = document.getElementById('autoplay-progress-bar');
+        progressText = document.getElementById('autoplay-progress-text');
+        startBtn = document.getElementById('autoplay-start-btn');
+        stopBtn = document.getElementById('autoplay-stop-btn');
+        logContainer = document.getElementById('autoplay-log-container');
+
+        // 绑定事件
+        startBtn.addEventListener('click', startAutoplay);
+        stopBtn.addEventListener('click', stopAutoplay);
+        panel.querySelector('.btn-minimize').addEventListener('click', toggleMinimize);
+        panel.querySelector('.btn-close').addEventListener('click', () => {
+            stopAutoplay();
+            panel.style.display = 'none';
+        });
+        panel.querySelector('.minimized-icon').addEventListener('click', toggleMinimize);
+
+        // 拖拽功能
+        makeDraggable(panel, panel.querySelector('.panel-header'));
+    }
+
+    function makeDraggable(element, handle) {
+        let isDragging = false;
+        let offsetX, offsetY;
+
+        handle.addEventListener('mousedown', (e) => {
+            isDragging = true;
+            offsetX = e.clientX - element.getBoundingClientRect().left;
+            offsetY = e.clientY - element.getBoundingClientRect().top;
+            element.style.transition = 'none';
+        });
+
+        document.addEventListener('mousemove', (e) => {
+            if (!isDragging) return;
+            const x = e.clientX - offsetX;
+            const y = e.clientY - offsetY;
+            element.style.left = x + 'px';
+            element.style.top = y + 'px';
+            element.style.right = 'auto';
+        });
+
+        document.addEventListener('mouseup', () => {
+            isDragging = false;
+            element.style.transition = 'all 0.3s ease';
+        });
+    }
+
+    function toggleMinimize() {
+        controlPanel.classList.toggle('minimized');
+    }
+
+    function updateStatus(text, color = '#fff') {
+        if (statusText) {
+            statusText.textContent = text;
+            statusText.style.color = color;
+        }
+    }
+
+    function updateProgress(text, percent = -1) {
+        if (progressText) progressText.textContent = text;
+        if (progressBar && percent >= 0) {
+            progressBar.style.width = Math.min(100, Math.max(0, percent)) + '%';
+        }
+        const percentEl = document.getElementById('autoplay-progress-percent');
+        if (percentEl && percent >= 0) {
+            percentEl.textContent = Math.round(percent) + '%';
+        }
+    }
+
+    function addLog(message) {
+        if (!logContainer) return;
+        const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+        const entry = document.createElement('div');
+        entry.className = 'log-entry';
+        entry.innerHTML = `<span class="log-time">${time}</span>${message}`;
+        logContainer.appendChild(entry);
+        logContainer.scrollTop = logContainer.scrollHeight;
+
+        // 保持最多50条日志
+        while (logContainer.children.length > 50) {
+            logContainer.removeChild(logContainer.firstChild);
+        }
+    }
+
+    // ========== 开始/停止控制 ==========
+    function startAutoplay() {
+        if (isRunning) return;
+        isRunning = true;
+        updateStatus('运行中', '#4ade80');
+        startBtn.disabled = true;
+        stopBtn.disabled = false;
+        addLog('🚀 自动播放已启动');
+
+        // 立即执行一次
+        checkAndProcess();
+
+        // 设置定时器
+        mainInterval = setInterval(checkAndProcess, CONFIG.checkInterval);
+    }
+
+    function stopAutoplay() {
+        if (!isRunning) return;
+        isRunning = false;
+        updateStatus('已停止', '#f87171');
+        startBtn.disabled = false;
+        stopBtn.disabled = true;
+        addLog('⏹ 自动播放已停止');
+
+        if (mainInterval) {
+            clearInterval(mainInterval);
+            mainInterval = null;
+        }
+    }
+
     // ========== 工具函数 ==========
     function log(...args) {
         if (CONFIG.debug) {
@@ -38,6 +376,7 @@
                 ...args
             );
         }
+        addLog(args.join(' '));
     }
 
     function sleep(ms) {
@@ -298,8 +637,44 @@
     let isProcessing = false;
     let lastProgressTime = 0;
 
+    // 更新进度显示
+    function updateProgressDisplay() {
+        const items = getResourceItems();
+        if (items.length === 0) {
+            updateProgress('无资源', 0);
+            return;
+        }
+
+        const completedCount = Array.from(items).filter(item => isItemCompleted(item)).length;
+        const percent = (completedCount / items.length) * 100;
+        const activeItem = getActiveResourceItem();
+        const contentType = getContentType();
+
+        let statusInfo = '';
+        if (contentType === 'video') {
+            const video = findVideo();
+            if (video && video.duration) {
+                const videoPct = ((video.currentTime / video.duration) * 100).toFixed(1);
+                const remaining = (video.duration - video.currentTime).toFixed(0);
+                statusInfo = ` | 视频: ${videoPct}% (${remaining}s)`;
+            }
+        } else if (contentType === 'ppt') {
+            const slideInfo = getSlideInfo();
+            if (slideInfo) {
+                statusInfo = ` | PPT: ${slideInfo.current}/${slideInfo.total}`;
+            }
+        } else if (contentType === 'practice') {
+            statusInfo = ' | 练习中';
+        }
+
+        updateProgress(`已完成 ${completedCount}/${items.length}${statusInfo}`, percent);
+    }
+
     async function checkAndProcess() {
         if (isProcessing) return;
+
+        // 更新进度显示
+        updateProgressDisplay();
 
         dismissDialogs();
 
@@ -325,6 +700,7 @@
                 // 本节所有内容都完成了，尝试跳到下一节
                 log('🎉 本节所有内容已完成!');
                 log(`资源状态: ${getResourceSummary()}`);
+                updateStatus('已完成', '#4ade80');
 
                 const nextSectionBtn = findNextSectionButton();
                 if (nextSectionBtn) {
@@ -336,6 +712,8 @@
                     await initVideoPlayer();
                 } else {
                     log('⚠️ 未找到"下一节"按钮，所有任务可能已完成');
+                    updateProgress('所有任务已完成!', 100);
+                    stopAutoplay();
                 }
             }
             isProcessing = false;
@@ -363,13 +741,18 @@
                     } catch (e) { /* ignore */ }
                 }
 
-                // 定期输出进度
+                // 更新视频进度
                 const now = Date.now();
-                if (!video.paused && video.duration && now - lastProgressTime > 30000) {
+                if (!video.paused && video.duration) {
                     const pct = ((video.currentTime / video.duration) * 100).toFixed(1);
                     const remaining = (video.duration - video.currentTime).toFixed(0);
-                    log(`📊 [视频] ${pct}% | 剩余 ${remaining}s`);
-                    lastProgressTime = now;
+                    updateProgress(`视频播放中: ${pct}% | 剩余 ${remaining}s`, (video.currentTime / video.duration) * 100);
+                    
+                    // 定期输出日志
+                    if (now - lastProgressTime > 30000) {
+                        log(`📊 [视频] ${pct}% | 剩余 ${remaining}s`);
+                        lastProgressTime = now;
+                    }
                 }
             }
         } else if (contentType === 'ppt') {
@@ -390,26 +773,24 @@
     // ========== 启动 ==========
 
     async function start() {
+        // 创建悬浮窗
+        createControlPanel();
+        
         log('========================================');
-        log('  讯飞智课自动刷课脚本 v2.0 已启动');
+        log('  讯飞智课自动刷课脚本 v2.1 已加载');
         log(`  播放速率: ${CONFIG.playbackRate}x`);
         log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
         log('========================================');
 
-        await sleep(3000);
+        await sleep(1000);
 
         // 显示当前资源状态
         log(`📋 当前资源: ${getResourceSummary()}`);
-
-        // 初始化视频
-        await initVideoPlayer();
-
-        // 定时检查
-        setInterval(checkAndProcess, CONFIG.checkInterval);
+        updateProgressDisplay();
 
         // 监听视频ended事件
         document.addEventListener('ended', async (e) => {
-            if (e.target.tagName === 'VIDEO') {
+            if (e.target.tagName === 'VIDEO' && isRunning) {
                 log('视频播放结束事件触发');
                 await sleep(1000);
                 await checkAndProcess();
@@ -418,6 +799,7 @@
 
         // 监听页面变化（SPA动态加载）
         const observer = new MutationObserver(async () => {
+            if (!isRunning) return;
             const video = findVideo();
             if (video && video.src !== currentVideoSrc) {
                 log('检测到视频源变化，重新初始化');
@@ -428,7 +810,7 @@
         });
         observer.observe(document.body, { childList: true, subtree: true });
 
-        log('脚本初始化完成，开始监控...');
+        log('脚本加载完成，点击"开始"按钮启动自动播放');
     }
 
     start();
