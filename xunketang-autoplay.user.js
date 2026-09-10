@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         讯飞智课自动刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      3.0
 // @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
 // @author       kumiko
 // @match        *://*.fifedu.com/*
@@ -29,8 +29,8 @@
         slideIntervalPage: 3500,
         // 单个PPT最多点击多少次（防止异常情况下无限连点把浏览器拖死）
         maxSlideClicks: 300,
-        // 是否自动处理 PowerPoint Online 崩溃弹窗
-        autoRestartPptViewer: true,
+        // 检测到 PPT 播放器崩溃（"很抱歉,遇到问题"）时，跳过该资源而不是重试
+        skipResourceOnPptCrash: true,
         // PPT多久没有任何变化算卡住（毫秒）
         slideStuckTimeout: 30000,
         // 卡住后每隔多久重试一次（毫秒）
@@ -45,6 +45,8 @@
 
     // ========== 悬浮窗控制状态 ==========
     let isRunning = false;
+    // 当前 frame 是不是正在跑刷课逻辑的学习页
+    let isStudyFrame = false;
     let controlPanel = null;
     let statusText = null;
     let progressBar = null;
@@ -57,8 +59,9 @@
 
     // ========== 悬浮窗UI ==========
     function createControlPanel() {
-        // 只在整个页面里注入一份面板，避免 iframe 里出现多个重复面板
+        // 只在整个页面里注入一份面板
         if (window.top !== window.self) return;
+        if (document.getElementById('xunketang-autoplay-panel')) return;
 
         const panel = document.createElement('div');
         panel.id = 'xunketang-autoplay-panel';
@@ -444,6 +447,11 @@
         return isNaN(value) ? null : value;
     }
 
+    // 被跳过的资源项（例如 PPT 播放器崩溃无法继续的），不再回头处理
+    function isItemSkipped(item) {
+        return !!(item && item.dataset && item.dataset.xkSkipped === '1');
+    }
+
     // 获取下一个未完成的资源项
     function getNextUnfinishedItem() {
         const items = getResourceItems();
@@ -455,14 +463,14 @@
                 continue;
             }
             // 找到当前项之后的未完成项
-            if (foundActive && !isItemCompleted(item)) {
+            if (foundActive && !isItemCompleted(item) && !isItemSkipped(item)) {
                 return item;
             }
         }
 
         // 如果当前项之后都完成了，找任何未完成的
         for (const item of items) {
-            if (!isItemCompleted(item)) {
+            if (!isItemCompleted(item) && !isItemSkipped(item)) {
                 return item;
             }
         }
@@ -677,24 +685,61 @@
         } catch (e) { /* 跨域忽略 */ }
     }
 
-    // PowerPoint Online（owas.fifedu.com 的 iframe）崩溃时会显示"很抱歉,遇到问题"，
-    // 这里自动点它的"重新启动"，尽量把播放器救回来。
+    // 查找 PowerPoint Online 的崩溃提示（"很抱歉,遇到问题 / 会话 ID / 重新启动"）
     // 注意：只检查叶子节点，对大容器取 textContent 会遍历整棵子树，非常耗性能
+    function findPptCrashDialog() {
+        const nodes = document.querySelectorAll('button, a, span, div, p, li');
+        for (const el of nodes) {
+            if (el.children.length > 0) continue;
+            const text = (el.textContent || '').trim();
+            if (!text) continue;
+            if (text === '重新启动') return el;
+            if (text.includes('很抱歉') && text.includes('遇到问题')) return el;
+        }
+        return null;
+    }
+
+    // 崩溃弹窗可能出现在 PPT 的 iframe 里，跨域读不到，所以由那个 iframe 的脚本
+    // 通过 postMessage 通知学习页；学习页自己检测到就直接处理
     function watchPptViewerCrash() {
-        if (!CONFIG.autoRestartPptViewer) return;
-        let lastRestartAt = 0;
+        if (!CONFIG.skipResourceOnPptCrash) return;
+        let lastReportAt = 0;
         setInterval(() => {
-            if (Date.now() - lastRestartAt < 60000) return;
-            const nodes = document.querySelectorAll('button, a, span, div, li');
-            for (const el of nodes) {
-                if (el.children.length > 0) continue;
-                if ((el.textContent || '').trim() !== '重新启动') continue;
-                lastRestartAt = Date.now();
-                console.warn('[讯飞刷课脚本] 检测到 PPT 播放器崩溃弹窗，自动点击"重新启动"');
-                try { el.click(); } catch (e) { /* ignore */ }
+            if (Date.now() - lastReportAt < 60000) return;
+            if (!findPptCrashDialog()) return;
+            lastReportAt = Date.now();
+
+            if (isStudyFrame) {
+                handlePptCrash();
                 return;
             }
+            console.warn('[讯飞刷课脚本] 检测到 PPT 播放器崩溃弹窗，通知学习页跳过该资源');
+            try {
+                window.top.postMessage({
+                    type: 'xk-ppt-crash',
+                    href: location.href,
+                }, '*');
+            } catch (e) { /* ignore */ }
         }, 10000);
+    }
+
+    // 检测到 PPT 播放器崩溃：把当前资源标记为跳过，直接切到下一个
+    function handlePptCrash() {
+        const now = Date.now();
+        if (now - lastCrashHandledAt < 15000) return;
+
+        const activeItem = getActiveResourceItem();
+        if (!activeItem) return;
+        // 已经切到视频上了，说明是旧 iframe 的滞后通知，忽略
+        if (getContentType() === 'video') return;
+        lastCrashHandledAt = now;
+
+        activeItem.dataset.xkSkipped = '1';
+        const name = (activeItem.textContent || '').trim().substring(0, 40);
+        log(`⏭ PPT播放器崩溃，跳过该资源: ${name}`);
+
+        resetPPTState();
+        goToNextResource();
     }
 
     // 关闭弹窗
@@ -758,11 +803,15 @@
     let pptNotified = false;
     let pptRetryAt = 0;
     let pptNoButtonCount = 0;
+    // 最近一次因 PPT 崩溃而跳过资源的时间
+    let lastCrashHandledAt = 0;
 
     // 以"站点保存的进度"为准：新播放器的 .page 数字会和真实状态不同步，不能作为唯一依据
     async function handlePPT() {
         const now = Date.now();
         const activeItem = getActiveResourceItem();
+        // 已被标记跳过的资源（例如播放器崩溃），不再翻页
+        if (activeItem && isItemSkipped(activeItem)) return false;
         const progress = activeItem ? getItemProgress(activeItem) : null;
         const slideInfo = getSlideInfo();
         const slideKey = slideInfo ? `${slideInfo.current}/${slideInfo.total}` : '';
@@ -913,20 +962,11 @@
         updateProgress(`已完成 ${completedCount}/${items.length}${statusInfo}`, percent);
     }
 
-    async function checkAndProcess() {
-        if (isProcessing) return;
-
-        // 更新进度显示
-        updateProgressDisplay();
-
-        dismissDialogs();
-
-        // 检查当前活跃资源项是否已完成
-        const activeItem = getActiveResourceItem();
-        if (activeItem && isItemCompleted(activeItem)) {
-            // 当前内容已完成，尝试切换到下一个
-            isProcessing = true;
-            log('当前内容已完成，查找下一个未完成的内容...');
+    // 切到下一个未完成资源；本节都没有了就去下一节
+    async function goToNextResource() {
+        if (isProcessing) return false;
+        isProcessing = true;
+        try {
             log(`资源状态: ${getResourceSummary()}`);
 
             const nextItem = getNextUnfinishedItem();
@@ -939,27 +979,54 @@
                 await sleep(CONFIG.switchWait);
                 // 新内容加载后初始化
                 await initVideoPlayer();
-            } else {
-                // 本节所有内容都完成了，尝试跳到下一节
-                log('🎉 本节所有内容已完成!');
-                log(`资源状态: ${getResourceSummary()}`);
-                updateStatus('已完成', '#4ade80');
-
-                const nextSectionBtn = findNextSectionButton();
-                if (nextSectionBtn) {
-                    log('✅ 点击"继续学习下一节"');
-                    resetPPTState();
-                    currentVideoSrc = '';
-                    nextSectionBtn.click();
-                    await sleep(CONFIG.switchWait);
-                    await initVideoPlayer();
-                } else {
-                    log('⚠️ 未找到"下一节"按钮，所有任务可能已完成');
-                    updateProgress('所有任务已完成!', 100);
-                    stopAutoplay();
-                }
+                return true;
             }
+
+            // 本节所有内容都完成了（或被跳过），尝试跳到下一节
+            log('🎉 本节所有内容已完成!');
+            updateStatus('已完成', '#4ade80');
+
+            const nextSectionBtn = findNextSectionButton();
+            if (nextSectionBtn) {
+                log('✅ 点击"继续学习下一节"');
+                resetPPTState();
+                currentVideoSrc = '';
+                nextSectionBtn.click();
+                await sleep(CONFIG.switchWait);
+                await initVideoPlayer();
+                return true;
+            }
+
+            log('⚠️ 未找到"下一节"按钮，所有任务可能已完成');
+            updateProgress('所有任务已完成!', 100);
+            stopAutoplay();
+            return false;
+        } finally {
             isProcessing = false;
+        }
+    }
+
+    async function checkAndProcess() {
+        if (isProcessing) return;
+
+        // 更新进度显示
+        updateProgressDisplay();
+
+        dismissDialogs();
+
+        // 检查当前活跃资源项是否已完成
+        const activeItem = getActiveResourceItem();
+
+        // 被跳过的资源（例如 PPT 播放器崩溃）直接略过
+        if (activeItem && isItemSkipped(activeItem)) {
+            await goToNextResource();
+            return;
+        }
+
+        if (activeItem && isItemCompleted(activeItem)) {
+            // 当前内容已完成，尝试切换到下一个
+            log('当前内容已完成，查找下一个未完成的内容...');
+            await goToNextResource();
             return;
         }
 
@@ -1016,11 +1083,12 @@
     // ========== 启动 ==========
 
     async function start() {
+        isStudyFrame = true;
         // 创建悬浮窗
         createControlPanel();
         
         log('========================================');
-        log('  讯飞智课自动刷课脚本 v2.4 已加载');
+        log('  讯飞智课自动刷课脚本 v3.0 已加载');
         log(`  播放速率: ${CONFIG.playbackRate}x`);
         log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
         log('========================================');
@@ -1029,6 +1097,13 @@
 
         // PowerPoint Online 崩溃自救（播放器在 iframe 里，主页面也要帮忙盯着）
         watchPptViewerCrash();
+
+        // 接收来自 PPT iframe 的崩溃通知
+        window.addEventListener('message', (e) => {
+            const data = e.data;
+            if (!data || data.type !== 'xk-ppt-crash') return;
+            handlePptCrash();
+        });
 
         // 显示当前资源状态
         log(`📋 当前资源: ${getResourceSummary()}`);
@@ -1067,7 +1142,7 @@
         // 顶层页面负责全部刷课逻辑
         start();
     } else {
-        // 子 iframe 里只保留 PPT 崩溃自救，不再各跑一份逻辑（多份实例同时点会把浏览器拖死）
+        // 子 iframe 里只保留 PPT 崩溃检测，不再各跑一份逻辑
         watchPptViewerCrash();
     }
 })();
