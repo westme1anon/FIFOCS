@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         讯飞智课自动刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      3.0
+// @version      3.1
 // @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
 // @author       kumiko
 // @match        *://*.fifedu.com/*
@@ -39,6 +39,10 @@
         switchWait: 3000,
         // 资源完成所需的进度百分比（站点保存进度要求，常见为 90）
         progressRequired: 90,
+        // 自适应练习：点击"交卷"后，等待站点更新进度的时间（毫秒）
+        practiceSubmitWait: 60000,
+        // 练习已交卷但站点迟迟不更新进度时，是否跳过该资源
+        skipPracticeIfNotMarked: true,
         // 日志输出到控制台
         debug: true,
     };
@@ -586,6 +590,12 @@
                 if (span.textContent.trim() === '开始练习') return 'practice';
             }
         }
+        // 已经进入自适应练习页面（有"交卷"按钮）
+        if (findSubmitPracticeButton()) return 'practice';
+        // 已经交卷、正在等站点更新进度（页面这时候可能已经没有"交卷"按钮了）
+        if (practiceSubmitAt && Date.now() - practiceSubmitAt < CONFIG.practiceSubmitWait + 60000) {
+            return 'practice';
+        }
         return 'unknown';
     }
 
@@ -596,6 +606,24 @@
             if (btn.textContent.trim().includes('开始练习')) {
                 return btn;
             }
+        }
+        return null;
+    }
+
+    // 查找练习页的"交卷"按钮（结构形如 <div class="text">交卷</div>，事件挂在祖先上，
+    // 所以直接点击文字节点即可，click 事件会冒泡上去）
+    function findSubmitPracticeButton() {
+        const quick = document.querySelectorAll('div.text, span.text, .el-button');
+        for (const el of quick) {
+            const text = (el.textContent || '').trim();
+            if (text === '交卷' || text === '提交' || text === '提交答案') return el;
+        }
+        // 兜底：全页扫叶子节点（只取叶子，避免对大容器取 textContent）
+        const nodes = document.querySelectorAll('button, [role="button"], div, span, a');
+        for (const el of nodes) {
+            if (el.children.length > 0) continue;
+            const text = (el.textContent || '').trim();
+            if (text === '交卷' || text === '提交' || text === '提交答案') return el;
         }
         return null;
     }
@@ -744,6 +772,8 @@
 
     // 关闭弹窗
     function dismissDialogs() {
+        // 交卷确认框不能被自己关掉，等它处理完再恢复
+        if (Date.now() < suppressDismissUntil) return;
         const closeBtns = document.querySelectorAll(
             '.el-dialog__headerbtn, .el-message-box__headerbtn, .el-notification__closeBtn'
         );
@@ -805,6 +835,11 @@
     let pptNoButtonCount = 0;
     // 最近一次因 PPT 崩溃而跳过资源的时间
     let lastCrashHandledAt = 0;
+    // 自适应练习状态
+    let practiceSubmitAt = 0;
+    let practiceWaitLogged = false;
+    // 交卷弹确认框期间，临时禁止自动关框
+    let suppressDismissUntil = 0;
 
     // 以"站点保存的进度"为准：新播放器的 .page 数字会和真实状态不同步，不能作为唯一依据
     async function handlePPT() {
@@ -924,6 +959,84 @@
         pptNoButtonCount = 0;
     }
 
+    // ========== 自适应练习处理 ==========
+
+    function resetPracticeState() {
+        practiceSubmitAt = 0;
+        practiceWaitLogged = false;
+    }
+
+    // 点"交卷"之后可能弹出 Element UI 确认框，这里替用户点"确定"
+    function confirmPracticeSubmit() {
+        if (!practiceSubmitAt || Date.now() - practiceSubmitAt > 30000) return false;
+        const boxes = document.querySelectorAll('.el-message-box, .el-dialog');
+        for (const box of boxes) {
+            if (box.offsetParent === null) continue;
+            if (!/交卷|提交|作答|确定要|确认要/.test(box.textContent || '')) continue;
+            const btns = box.querySelectorAll('button');
+            for (const btn of btns) {
+                const text = (btn.textContent || '').trim();
+                if (text === '确定' || text === '确认' || text === '继续' || text === '交卷') {
+                    clickElement(btn);
+                    log('✅ 已确认交卷');
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    async function handlePractice() {
+        // 1) 还没进入练习：点"开始练习"
+        const startBtn = findStartPracticeButton();
+        if (startBtn) {
+            log('📝 检测到自适应练习，点击"开始练习"...');
+            clickElement(startBtn);
+            await sleep(3000);
+            return false;
+        }
+
+        const activeItem = getActiveResourceItem();
+
+        // 2) 已进入练习页：点"交卷"
+        const submitBtn = findSubmitPracticeButton();
+        if (submitBtn) {
+            // 刚点过就等一等，先处理确认框
+            if (practiceSubmitAt && Date.now() - practiceSubmitAt < 30000) {
+                confirmPracticeSubmit();
+                return false;
+            }
+            practiceSubmitAt = Date.now();
+            practiceWaitLogged = false;
+            suppressDismissUntil = practiceSubmitAt + 30000;
+            log('📝 自适应练习：点击"交卷"');
+            clickElement(submitBtn);
+            return false;
+        }
+
+        // 3) 交卷之后：确认框兜底 + 等站点把资源标记为完成
+        if (!practiceSubmitAt) return false;
+        confirmPracticeSubmit();
+
+        const waited = Date.now() - practiceSubmitAt;
+        if (activeItem && isItemCompleted(activeItem)) return true;
+
+        if (waited > 10000 && !practiceWaitLogged) {
+            practiceWaitLogged = true;
+            log('⏳ 练习已交卷，等待站点更新进度...');
+        }
+
+        if (waited > CONFIG.practiceSubmitWait) {
+            if (CONFIG.skipPracticeIfNotMarked && activeItem && !isItemSkipped(activeItem)) {
+                activeItem.dataset.xkSkipped = '1';
+                log(`⏭ 练习已交卷但站点未更新进度（等待 ${Math.round(waited / 1000)} 秒），跳过该资源`);
+                resetPracticeState();
+                goToNextResource();
+            }
+        }
+        return false;
+    }
+
     // ========== 主控制逻辑 ==========
 
     let isProcessing = false;
@@ -974,6 +1087,7 @@
                 const name = nextItem.textContent?.trim().substring(0, 40) || '未知';
                 log(`👉 切换到下一个内容: ${name}`);
                 resetPPTState();
+                resetPracticeState();
                 currentVideoSrc = '';
                 nextItem.click();
                 await sleep(CONFIG.switchWait);
@@ -990,6 +1104,7 @@
             if (nextSectionBtn) {
                 log('✅ 点击"继续学习下一节"');
                 resetPPTState();
+                resetPracticeState();
                 currentVideoSrc = '';
                 nextSectionBtn.click();
                 await sleep(CONFIG.switchWait);
@@ -1069,14 +1184,11 @@
             await handlePPT();
         } else if (contentType === 'practice') {
             isProcessing = true;
-            log('📝 检测到自适应练习，点击"开始练习"...');
-            const startBtn = findStartPracticeButton();
-            if (startBtn) {
-                startBtn.click();
-                log('✅ 已点击"开始练习"按钮，等待完成...');
-                await sleep(5000);
+            try {
+                await handlePractice();
+            } finally {
+                isProcessing = false;
             }
-            isProcessing = false;
         }
     }
 
@@ -1088,7 +1200,7 @@
         createControlPanel();
         
         log('========================================');
-        log('  讯飞智课自动刷课脚本 v3.0 已加载');
+        log('  讯飞智课自动刷课脚本 v3.1 已加载');
         log(`  播放速率: ${CONFIG.playbackRate}x`);
         log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
         log('========================================');
