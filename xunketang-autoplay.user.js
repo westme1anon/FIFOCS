@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         讯飞智课自动刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.4
 // @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
 // @author       kumiko
 // @match        *://*.fifedu.com/*
@@ -47,6 +47,12 @@
         pdfScrollInterval: 2500,
         // PDF：每次滚动的比例（相对阅读区高度）
         pdfScrollStep: 0.9,
+        // PDF：进度多久没变化就认为卡住（毫秒）
+        pdfStuckTimeout: 30000,
+        // 本节一个资源都没有时，等多久确认后进入下一节（毫秒）
+        emptySectionWait: 8000,
+        // 两次"尝试进入下一节"之间的最小间隔（毫秒）
+        emptySectionCooldown: 20000,
         // 日志输出到控制台
         debug: true,
     };
@@ -517,6 +523,16 @@
         for (const btn of gradientBtns) {
             if (btn.textContent.includes('下一节')) {
                 return btn;
+            }
+        }
+        // 兜底：有些入口是 div/span 做的按钮，只在叶子节点上匹配短文本
+        const nodes = document.querySelectorAll('div, span, a, [role="button"]');
+        for (const el of nodes) {
+            if (el.children.length > 0) continue;
+            const text = (el.textContent || '').trim();
+            if (text === '下一节' || text === '下一章'
+                || text === '继续学习下一节') {
+                return el;
             }
         }
         return null;
@@ -1055,6 +1071,12 @@
     // 所以由主页面发消息，iframe 里的脚本实例负责滚动
 
     let pdfSignaledFrame = null;
+    let pdfLastProgress = null;
+    let pdfLastProgressAt = 0;
+    let pdfRestartCount = 0;
+    let pdfLastRestartAt = 0;
+    let pdfReloadCount = 0;
+    let pdfLastReloadAt = 0;
 
     function signalPdfFrame(type) {
         const frame = findPdfFrame();
@@ -1068,18 +1090,70 @@
         const frame = findPdfFrame();
         if (!frame) return false;
 
+        const item = getActiveResourceItem();
+        const progress = item ? getItemProgress(item) : null;
+
         if (pdfSignaledFrame !== frame) {
             pdfSignaledFrame = frame;
+            pdfLastProgress = progress;
+            pdfLastProgressAt = Date.now();
             log('📕 检测到 PDF 资源，已通知内置阅读器自动翻页');
         }
         // 每隔一轮重发一次，避免阅读器比脚本晚加载导致漏掉指令
         signalPdfFrame('xk-pdf-start');
+
+        // 进度变了就重新计时
+        if (progress !== pdfLastProgress) {
+            pdfLastProgress = progress;
+            pdfLastProgressAt = Date.now();
+            return false;
+        }
+
+        // 进度长时间不动：先让阅读器从头再滚一遍，还不行就重新加载这个资源
+        const stuckFor = Date.now() - pdfLastProgressAt;
+        if (stuckFor < CONFIG.pdfStuckTimeout) return false;
+
+        const now = Date.now();
+        if (pdfRestartCount < 5 && now - pdfLastRestartAt > 30000) {
+            pdfLastRestartAt = now;
+            pdfRestartCount++;
+            pdfLastProgressAt = now;
+            const pct = progress === null ? '未知' : progress + '%';
+            log(`⚠️ PDF 进度 ${Math.round(stuckFor / 1000)} 秒没变化（当前 ${pct}），让阅读器从头再滚一遍`);
+            signalPdfFrame('xk-pdf-restart');
+            return false;
+        }
+
+        if (pdfReloadCount < 2 && now - pdfLastReloadAt > 60000) {
+            pdfLastReloadAt = now;
+            pdfReloadCount++;
+            pdfLastProgressAt = now;
+            log('⚠️ PDF 仍未推进，重新点一次该资源，让阅读器重新加载');
+            if (item) clickElement(item);
+        }
         return false;
     }
 
     function resetPdfState() {
         signalPdfFrame('xk-pdf-stop');
         pdfSignaledFrame = null;
+        pdfLastProgress = null;
+        pdfLastProgressAt = 0;
+        pdfRestartCount = 0;
+        pdfLastRestartAt = 0;
+        pdfReloadCount = 0;
+        pdfLastReloadAt = 0;
+    }
+
+    // 阅读器自己报告"加载不出内容"：重新点一次该资源让它重载
+    let pdfErrorHandledAt = 0;
+    function handlePdfError() {
+        const now = Date.now();
+        if (now - pdfErrorHandledAt < 60000) return;
+        pdfErrorHandledAt = now;
+        log('⚠️ PDF 阅读器没有渲染出内容，重新点一次该资源让它重新加载');
+        const item = getActiveResourceItem();
+        if (item) clickElement(item);
     }
 
     // ========== 主控制逻辑 ==========
@@ -1125,6 +1199,42 @@
     }
 
     // 切到下一个未完成资源；本节都没有了就去下一节
+    let emptySectionSince = 0;
+    let lastNextSectionClickAt = 0;
+
+    // 本节没有资源时，直接尝试进入下一节
+    async function goToNextSection() {
+        if (isProcessing) return false;
+
+        // 只在章节学习页做这件事，避免在入口页/课程列表页乱点
+        const onStudyPage = /\/pattern\/chapter|chapterId=/i.test(location.href);
+        if (!onStudyPage) return false;
+
+        const now = Date.now();
+        if (now - lastNextSectionClickAt < CONFIG.emptySectionCooldown) return false;
+        lastNextSectionClickAt = now;
+
+        const nextSectionBtn = findNextSectionButton();
+        if (!nextSectionBtn) {
+            log('⚠️ 本节没有资源，也没找到"下一节"按钮，需要手动切换章节');
+            return false;
+        }
+
+        isProcessing = true;
+        try {
+            log('⏭ 本节没有资源，点击"下一节"');
+            resetPPTState();
+            resetPracticeState();
+            resetPdfState();
+            currentVideoSrc = '';
+            clickElement(nextSectionBtn);
+            await sleep(CONFIG.switchWait);
+        } finally {
+            isProcessing = false;
+        }
+        return true;
+    }
+
     async function goToNextResource() {
         if (isProcessing) return false;
         isProcessing = true;
@@ -1182,6 +1292,16 @@
 
         // 检查当前活跃资源项是否已完成
         const activeItem = getActiveResourceItem();
+
+        // 本节一个资源都没有：等一会儿确认不是还没加载出来，然后直接进下一节
+        if (getResourceItems().length === 0) {
+            if (!emptySectionSince) emptySectionSince = Date.now();
+            if (Date.now() - emptySectionSince > CONFIG.emptySectionWait) {
+                await goToNextSection();
+            }
+            return;
+        }
+        emptySectionSince = 0;
 
         // 被跳过的资源（例如 PPT 播放器崩溃）直接略过
         if (activeItem && isItemSkipped(activeItem)) {
@@ -1253,7 +1373,7 @@
         createControlPanel();
         
         log('========================================');
-        log('  讯飞智课自动刷课脚本 v3.2 已加载');
+        log('  讯飞智课自动刷课脚本 v3.4 已加载');
         log(`  播放速率: ${CONFIG.playbackRate}x`);
         log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
         log('========================================');
@@ -1263,11 +1383,12 @@
         // PowerPoint Online 崩溃自救（播放器在 iframe 里，主页面也要帮忙盯着）
         watchPptViewerCrash();
 
-        // 接收来自 PPT iframe 的崩溃通知
+        // 接收子 iframe 的通知：PPT 播放器崩溃 / PDF 阅读器加载失败
         window.addEventListener('message', (e) => {
             const data = e.data;
-            if (!data || data.type !== 'xk-ppt-crash') return;
-            handlePptCrash();
+            if (!data || typeof data.type !== 'string') return;
+            if (data.type === 'xk-ppt-crash') handlePptCrash();
+            else if (data.type === 'xk-pdf-error') handlePdfError();
         });
 
         // 显示当前资源状态
@@ -1316,6 +1437,13 @@
         let enabled = false;
         let lastScrollAt = 0;
         let reachedEnd = false;
+        let startedAt = 0;
+        let errorReported = false;
+
+        function getBox() {
+            return document.getElementById('viewerContainer')
+                || document.scrollingElement;
+        }
 
         window.addEventListener('message', (e) => {
             const data = e.data;
@@ -1324,6 +1452,13 @@
                 if (reachedEnd) return;
                 if (!enabled) console.log('[讯飞刷课脚本] PDF阅读器：开始自动翻页');
                 enabled = true;
+                if (!startedAt) startedAt = Date.now();
+            } else if (data.type === 'xk-pdf-restart') {
+                const box = getBox();
+                if (box) box.scrollTop = 0;
+                reachedEnd = false;
+                enabled = true;
+                console.log('[讯飞刷课脚本] PDF阅读器：从头再滚一遍');
             } else if (data.type === 'xk-pdf-stop') {
                 enabled = false;
             }
@@ -1331,9 +1466,19 @@
 
         setInterval(() => {
             if (!enabled) return;
-            const box = document.getElementById('viewerContainer')
-                || document.scrollingElement;
+            const box = getBox();
             if (!box) return;
+
+            // 页面一直没有渲染出任何一页，多半是阅读器加载失败，通知主页面
+            if (!errorReported && startedAt
+                && Date.now() - startedAt > 20000
+                && document.querySelectorAll('.page').length === 0) {
+                errorReported = true;
+                console.warn('[讯飞刷课脚本] PDF阅读器：20 秒内没有渲染出任何页面');
+                try {
+                    window.top.postMessage({ type: 'xk-pdf-error' }, '*');
+                } catch (e) { /* ignore */ }
+            }
 
             // 到底了就不再滚
             if (box.scrollTop + box.clientHeight >= box.scrollHeight - 4) {
