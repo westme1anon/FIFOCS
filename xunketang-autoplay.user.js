@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         讯飞智课自动刷课脚本
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
 // @author       kumiko
 // @match        *://*.fifedu.com/*
@@ -43,6 +43,10 @@
         practiceSubmitWait: 60000,
         // 练习已交卷但站点迟迟不更新进度时，是否跳过该资源
         skipPracticeIfNotMarked: true,
+        // PDF：每次向下滚动的间隔（毫秒）
+        pdfScrollInterval: 2500,
+        // PDF：每次滚动的比例（相对阅读区高度）
+        pdfScrollStep: 0.9,
         // 日志输出到控制台
         debug: true,
     };
@@ -401,6 +405,7 @@
             clearInterval(pptInterval);
             pptInterval = null;
         }
+        resetPdfState();
     }
 
     // ========== 工具函数 ==========
@@ -596,7 +601,15 @@
         if (practiceSubmitAt && Date.now() - practiceSubmitAt < CONFIG.practiceSubmitWait + 60000) {
             return 'practice';
         }
+        // PDF 资源（阅读器嵌在 iframe 里）
+        if (findPdfFrame()) return 'pdf';
         return 'unknown';
+    }
+
+    // 查找 PDF 阅读器 iframe
+    function findPdfFrame() {
+        return document.querySelector('iframe[src*="pdfv-resource"]')
+            || document.querySelector('iframe[src*="viewer.html"]');
     }
 
     // 查找"开始练习"按钮
@@ -1037,6 +1050,38 @@
         return false;
     }
 
+    // ========== PDF 处理 ==========
+    // PDF 阅读器是跨域 iframe，主页面读不到里面的 DOM，
+    // 所以由主页面发消息，iframe 里的脚本实例负责滚动
+
+    let pdfSignaledFrame = null;
+
+    function signalPdfFrame(type) {
+        const frame = findPdfFrame();
+        if (!frame || !frame.contentWindow) return;
+        try {
+            frame.contentWindow.postMessage({ type: type }, '*');
+        } catch (e) { /* ignore */ }
+    }
+
+    async function handlePdf() {
+        const frame = findPdfFrame();
+        if (!frame) return false;
+
+        if (pdfSignaledFrame !== frame) {
+            pdfSignaledFrame = frame;
+            log('📕 检测到 PDF 资源，已通知内置阅读器自动翻页');
+        }
+        // 每隔一轮重发一次，避免阅读器比脚本晚加载导致漏掉指令
+        signalPdfFrame('xk-pdf-start');
+        return false;
+    }
+
+    function resetPdfState() {
+        signalPdfFrame('xk-pdf-stop');
+        pdfSignaledFrame = null;
+    }
+
     // ========== 主控制逻辑 ==========
 
     let isProcessing = false;
@@ -1070,6 +1115,10 @@
             }
         } else if (contentType === 'practice') {
             statusInfo = ' | 练习中';
+        } else if (contentType === 'pdf') {
+            const item = getActiveResourceItem();
+            const pct = item ? getItemProgress(item) : null;
+            statusInfo = pct === null ? ' | PDF' : ` | PDF: 已学 ${pct}%`;
         }
 
         updateProgress(`已完成 ${completedCount}/${items.length}${statusInfo}`, percent);
@@ -1088,6 +1137,7 @@
                 log(`👉 切换到下一个内容: ${name}`);
                 resetPPTState();
                 resetPracticeState();
+                resetPdfState();
                 currentVideoSrc = '';
                 nextItem.click();
                 await sleep(CONFIG.switchWait);
@@ -1105,6 +1155,7 @@
                 log('✅ 点击"继续学习下一节"');
                 resetPPTState();
                 resetPracticeState();
+                resetPdfState();
                 currentVideoSrc = '';
                 nextSectionBtn.click();
                 await sleep(CONFIG.switchWait);
@@ -1182,6 +1233,8 @@
             }
         } else if (contentType === 'ppt') {
             await handlePPT();
+        } else if (contentType === 'pdf') {
+            await handlePdf();
         } else if (contentType === 'practice') {
             isProcessing = true;
             try {
@@ -1200,7 +1253,7 @@
         createControlPanel();
         
         log('========================================');
-        log('  讯飞智课自动刷课脚本 v3.1 已加载');
+        log('  讯飞智课自动刷课脚本 v3.2 已加载');
         log(`  播放速率: ${CONFIG.playbackRate}x`);
         log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
         log('========================================');
@@ -1250,11 +1303,70 @@
         log('脚本加载完成，点击"开始"按钮启动自动播放');
     }
 
+    // ========== PDF 阅读器（在 iframe 内部运行） ==========
+
+    // 判断当前 iframe 是不是 PDF 阅读器
+    function isPdfViewerFrame() {
+        if (/pdfv-resource|viewer\.html/i.test(location.href)) return true;
+        return !!document.getElementById('viewerContainer');
+    }
+
+    // 阅读器自己滚动翻页，主页面只负责发开始/停止指令
+    function runPdfViewerHelper() {
+        let enabled = false;
+        let lastScrollAt = 0;
+        let reachedEnd = false;
+
+        window.addEventListener('message', (e) => {
+            const data = e.data;
+            if (!data || typeof data.type !== 'string') return;
+            if (data.type === 'xk-pdf-start') {
+                if (reachedEnd) return;
+                if (!enabled) console.log('[讯飞刷课脚本] PDF阅读器：开始自动翻页');
+                enabled = true;
+            } else if (data.type === 'xk-pdf-stop') {
+                enabled = false;
+            }
+        });
+
+        setInterval(() => {
+            if (!enabled) return;
+            const box = document.getElementById('viewerContainer')
+                || document.scrollingElement;
+            if (!box) return;
+
+            // 到底了就不再滚
+            if (box.scrollTop + box.clientHeight >= box.scrollHeight - 4) {
+                if (!reachedEnd) {
+                    reachedEnd = true;
+                    enabled = false;
+                    console.log('[讯飞刷课脚本] PDF阅读器：已读到最后一页');
+                }
+                return;
+            }
+
+            const now = Date.now();
+            if (now - lastScrollAt < CONFIG.pdfScrollInterval) return;
+            lastScrollAt = now;
+            const step = Math.max(200, box.clientHeight * CONFIG.pdfScrollStep);
+            const before = box.scrollTop;
+            box.scrollTop = before + step;
+            // 容器滚不动（可能是单页模式），改用阅读器自带的"下一页"按钮
+            if (box.scrollTop === before) {
+                const next = document.getElementById('next');
+                if (next) next.click();
+            }
+        }, 500);
+    }
+
     if (window.top === window.self) {
         // 顶层页面负责全部刷课逻辑
         start();
+    } else if (isPdfViewerFrame()) {
+        // PDF 阅读器：自己滚动翻页
+        runPdfViewerHelper();
     } else {
-        // 子 iframe 里只保留 PPT 崩溃检测，不再各跑一份逻辑
+        // 其它子 iframe 里只保留 PPT 崩溃检测，不再各跑一份逻辑
         watchPptViewerCrash();
     }
 })();
