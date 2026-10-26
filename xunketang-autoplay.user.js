@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         讯飞智课自动刷课脚本
-// @namespace    http://tampermonkey.net/
-// @version      3.4
-// @description  自动播放讯飞智课视频/PPT，完成后自动切换下一个，全部完成自动下一节
+// @name         讯飞智课自动刷课脚本 · 调度优化版
+// @namespace    https://xunketang.local/autoplay-scheduler
+// @version      4.0.1
+// @description  讯飞智课视频/PPT/PDF/练习助手，统一调度、可取消任务、独立资源状态与学习面板
 // @author       kumiko
 // @match        *://*.fifedu.com/*
 // @match        *://*.xunketang.com/*
@@ -53,14 +53,23 @@
         emptySectionWait: 8000,
         // 两次"尝试进入下一节"之间的最小间隔（毫秒）
         emptySectionCooldown: 20000,
+        // 播放器结束后，最多等待站点确认完成多久
+        progressConfirmWait: 60000,
+        // 切换后等待新播放器出现的最长时间
+        switchTimeout: 20000,
+        // 无法识别内容时最多等待多久
+        resourceLoadTimeout: 30000,
+        // 视频播放重试间隔；单次播放请求的等待上限
+        videoRetryInterval: 15000,
+        mediaPlayTimeout: 5000,
+        // PPT 卡住后最多尝试几次方向键
+        pptRetryLimit: 3,
         // 日志输出到控制台
         debug: true,
     };
 
     // ========== 悬浮窗控制状态 ==========
     let isRunning = false;
-    // 当前 frame 是不是正在跑刷课逻辑的学习页
-    let isStudyFrame = false;
     let controlPanel = null;
     let statusText = null;
     let progressBar = null;
@@ -68,220 +77,134 @@
     let startBtn = null;
     let stopBtn = null;
     let logContainer = null;
-    let mainInterval = null;
-    let pptInterval = null;
+    let resourceText = null;
+    let completedText = null;
+    let totalText = null;
+    let skippedText = null;
+    let kindText = null;
+    let statusIndicator = null;
 
     // ========== 悬浮窗UI ==========
     function createControlPanel() {
         // 只在整个页面里注入一份面板
         if (window.top !== window.self) return;
-        if (document.getElementById('xunketang-autoplay-panel')) return;
+        if (document.getElementById('xunketang-autoplay-scheduler-panel')) return;
 
         const panel = document.createElement('div');
-        panel.id = 'xunketang-autoplay-panel';
+        panel.id = 'xunketang-autoplay-scheduler-panel';
+        panel.setAttribute('role', 'complementary');
+        panel.setAttribute('aria-label', '讯飞智课学习助手');
         panel.innerHTML = `
             <style>
-                #xunketang-autoplay-panel {
-                    position: fixed;
-                    top: 20px;
-                    right: 20px;
-                    width: 320px;
-                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                    border-radius: 12px;
-                    box-shadow: 0 10px 40px rgba(0,0,0,0.3);
-                    z-index: 999999;
-                    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-                    color: #fff;
-                    overflow: hidden;
-                    transition: all 0.3s ease;
+                #xunketang-autoplay-scheduler-panel {
+                    --ink: #18342f; --muted: #76847e; --green: #16836a; --line: #e6ece8;
+                    position: fixed; top: 24px; right: 24px; width: 344px;
+                    max-width: calc(100vw - 24px); max-height: calc(100vh - 48px);
+                    overflow: auto; scrollbar-width: thin; z-index: 999999;
+                    color: var(--ink); background: #f8faf8; border: 1px solid rgba(255,255,255,.8);
+                    border-radius: 22px; box-shadow: 0 20px 65px #183b3026, 0 3px 12px #183b3010;
+                    font: 13px/1.5 'Segoe UI', 'Microsoft YaHei', sans-serif; text-align: left;
+                    isolation: isolate; color-scheme: light;
                 }
-                #xunketang-autoplay-panel.minimized {
-                    width: 60px;
-                    height: 60px;
-                    border-radius: 50%;
-                    cursor: pointer;
+                #xunketang-autoplay-scheduler-panel * { box-sizing: border-box; }
+                #xunketang-autoplay-scheduler-panel button { font: inherit; cursor: pointer; margin: 0; }
+                #xunketang-autoplay-scheduler-panel button:focus-visible,
+                #xunketang-autoplay-scheduler-panel summary:focus-visible { outline: 3px solid #6cd5b2; outline-offset: 3px; }
+                #xunketang-autoplay-scheduler-panel svg { display: block; flex-shrink: 0; }
+                #xunketang-autoplay-scheduler-panel .panel-header {
+                    display: flex; align-items: center; gap: 11px; padding: 22px 18px;
+                    color: #f7fffb; background: radial-gradient(ellipse at 90% 0%, #347c66 0%, transparent 70%), #193f35;
+                    cursor: grab; touch-action: none; user-select: none;
                 }
-                #xunketang-autoplay-panel.minimized .panel-content {
-                    display: none;
+                #xunketang-autoplay-scheduler-panel .brand-mark {
+                    display: grid; place-items: center; width: 38px; height: 38px;
+                    background: #ffffff12; border: 1px solid #ffffff24; border-radius: 12px;
                 }
-                #xunketang-autoplay-panel.minimized .minimized-icon {
-                    display: flex;
+                #xunketang-autoplay-scheduler-panel .brand-copy { flex: 1; min-width: 0; }
+                #xunketang-autoplay-scheduler-panel .panel-title { font-size: 16px; font-weight: 650; letter-spacing: .5px; }
+                #xunketang-autoplay-scheduler-panel .panel-subtitle { margin-top: 3px; color: #b4cfc2; font-size: 10px; letter-spacing: .8px; }
+                #xunketang-autoplay-scheduler-panel .panel-controls { display: flex; gap: 5px; align-self: flex-start; }
+                #xunketang-autoplay-scheduler-panel .panel-btn {
+                    display: grid; place-items: center; width: 25px; height: 25px; border: 0;
+                    background: transparent; color: #d1e5d9; border-radius: 7px; font-size: 18px; line-height: 1;
                 }
-                .minimized-icon {
-                    display: none;
-                    width: 100%;
-                    height: 100%;
-                    align-items: center;
-                    justify-content: center;
-                    font-size: 24px;
-                }
-                .panel-header {
-                    display: flex;
-                    justify-content: space-between;
-                    align-items: center;
-                    padding: 12px 16px;
-                    background: rgba(0,0,0,0.2);
-                    cursor: move;
-                }
-                .panel-title {
-                    font-size: 14px;
-                    font-weight: 600;
-                }
-                .panel-controls {
-                    display: flex;
-                    gap: 8px;
-                }
-                .panel-btn {
-                    width: 24px;
-                    height: 24px;
-                    border: none;
-                    border-radius: 50%;
-                    cursor: pointer;
-                    display: flex;
-                    align-items: center;
-                    justify-content: center;
-                    font-size: 12px;
-                    transition: transform 0.2s;
-                }
-                .panel-btn:hover {
-                    transform: scale(1.1);
-                }
-                .btn-minimize {
-                    background: #ffd93d;
-                    color: #333;
-                }
-                .btn-close {
-                    background: #ff6b6b;
-                    color: #fff;
-                }
-                .panel-content {
-                    padding: 16px;
-                }
-                .status-section {
-                    margin-bottom: 12px;
-                }
-                .status-label {
-                    font-size: 11px;
-                    opacity: 0.8;
-                    margin-bottom: 4px;
-                }
-                .status-value {
-                    font-size: 13px;
-                    font-weight: 500;
-                }
-                .progress-section {
-                    margin-bottom: 16px;
-                }
-                .progress-bar-container {
-                    width: 100%;
-                    height: 8px;
-                    background: rgba(255,255,255,0.2);
-                    border-radius: 4px;
-                    overflow: hidden;
-                    margin-top: 6px;
-                }
-                .progress-bar-fill {
-                    height: 100%;
-                    background: linear-gradient(90deg, #4ade80, #22c55e);
-                    border-radius: 4px;
-                    transition: width 0.3s ease;
-                    width: 0%;
-                }
-                .progress-info {
-                    display: flex;
-                    justify-content: space-between;
-                    margin-top: 4px;
-                    font-size: 11px;
-                    opacity: 0.9;
-                }
-                .button-section {
-                    display: flex;
-                    gap: 10px;
-                    margin-bottom: 12px;
-                }
-                .action-btn {
-                    flex: 1;
-                    padding: 10px;
-                    border: none;
-                    border-radius: 8px;
-                    font-size: 13px;
-                    font-weight: 600;
-                    cursor: pointer;
-                    transition: all 0.2s;
-                }
-                .action-btn:hover {
-                    transform: translateY(-2px);
-                    box-shadow: 0 4px 12px rgba(0,0,0,0.3);
-                }
-                .action-btn:disabled {
-                    opacity: 0.5;
-                    cursor: not-allowed;
-                    transform: none;
-                }
-                .btn-start {
-                    background: linear-gradient(135deg, #4ade80, #22c55e);
-                    color: #fff;
-                }
-                .btn-stop {
-                    background: linear-gradient(135deg, #f87171, #ef4444);
-                    color: #fff;
-                }
-                .log-section {
-                    background: rgba(0,0,0,0.2);
-                    border-radius: 8px;
-                    padding: 10px;
-                    max-height: 120px;
-                    overflow-y: auto;
-                }
-                .log-title {
-                    font-size: 11px;
-                    opacity: 0.8;
-                    margin-bottom: 6px;
-                }
-                .log-entry {
-                    font-size: 11px;
-                    line-height: 1.4;
-                    padding: 2px 0;
-                    border-bottom: 1px solid rgba(255,255,255,0.1);
-                }
-                .log-entry:last-child {
-                    border-bottom: none;
-                }
-                .log-time {
-                    opacity: 0.6;
-                    margin-right: 6px;
-                }
+                #xunketang-autoplay-scheduler-panel .panel-btn:hover { background: #ffffff1c; color: #fff; }
+                #xunketang-autoplay-scheduler-panel .panel-body { padding: 18px; }
+                #xunketang-autoplay-scheduler-panel .status-section { display: flex; align-items: flex-start; gap: 8px; margin-bottom: 16px; }
+                #xunketang-autoplay-scheduler-panel .status-dot { width: 7px; height: 7px; flex-shrink: 0; margin-top: 6px; border-radius: 50%; background: #8b9c92; box-shadow: 0 0 0 4px #8b9c9212; }
+                #xunketang-autoplay-scheduler-panel .status-value { color: #537063; font-size: 11px; overflow-wrap: anywhere; }
+                #xunketang-autoplay-scheduler-panel .resource-card { padding: 16px; background: #fff; border: 1px solid var(--line); border-radius: 14px; }
+                #xunketang-autoplay-scheduler-panel .card-eyebrow { display: flex; align-items: center; justify-content: space-between; color: var(--muted); font-size: 10px; letter-spacing: .7px; }
+                #xunketang-autoplay-scheduler-panel .type-tag { color: #44836c; background: #edf6ef; border-radius: 5px; padding: 2px 7px; font-size: 10px; letter-spacing: 0; }
+                #xunketang-autoplay-scheduler-panel .resource-title { margin: 10px 0 16px; font-size: 15px; font-weight: 600; line-height: 1.65; overflow-wrap: anywhere; }
+                #xunketang-autoplay-scheduler-panel .progress-heading { display: flex; align-items: baseline; justify-content: space-between; color: var(--muted); font-size: 10px; }
+                #xunketang-autoplay-scheduler-panel .progress-percent { color: var(--green); font-size: 23px; font-weight: 650; font-variant-numeric: tabular-nums; letter-spacing: -1px; }
+                #xunketang-autoplay-scheduler-panel .progress-bar-container { margin-top: 7px; height: 6px; background: #edf2ed; border-radius: 8px; overflow: hidden; }
+                #xunketang-autoplay-scheduler-panel .progress-bar-fill { width: 0%; height: 100%; background: linear-gradient(90deg,#16836a,#6abe8e); border-radius: inherit; transition: width .3s ease; }
+                #xunketang-autoplay-scheduler-panel .progress-info { margin-top: 9px; color: var(--muted); font-size: 10px; line-height: 1.6; }
+                #xunketang-autoplay-scheduler-panel .stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 8px; margin: 12px 0 18px; }
+                #xunketang-autoplay-scheduler-panel .stat { background: #eef3ee; border: 1px solid #e7eee6; border-radius: 11px; padding: 10px 11px; }
+                #xunketang-autoplay-scheduler-panel .stat-number { display: block; font-size: 21px; font-weight: 600; font-variant-numeric: tabular-nums; line-height: 1.2; }
+                #xunketang-autoplay-scheduler-panel .stat-label { display: block; color: var(--muted); font-size: 10px; margin-top: 5px; }
+                #xunketang-autoplay-scheduler-panel .stat-complete .stat-number { color: #16836a; }
+                #xunketang-autoplay-scheduler-panel .stat-skip .stat-number { color: #a17d43; }
+                #xunketang-autoplay-scheduler-panel .button-section { display: flex; gap: 9px; }
+                #xunketang-autoplay-scheduler-panel .action-btn { display: flex; align-items: center; justify-content: center; gap: 7px; border-radius: 10px; height: 43px; border: 1px solid transparent; font-size: 12px; font-weight: 600; transition: background .15s, transform .15s; }
+                #xunketang-autoplay-scheduler-panel .action-btn:active { transform: translateY(1px); }
+                #xunketang-autoplay-scheduler-panel .btn-start { flex: 1.6; color: #fff; background: #16836a; box-shadow: 0 4px 9px #16836a1c; }
+                #xunketang-autoplay-scheduler-panel .btn-start:hover:enabled { background: #106c56; }
+                #xunketang-autoplay-scheduler-panel .btn-stop { flex: 1; color: #556d60; background: #fff; border-color: #dfe7df; }
+                #xunketang-autoplay-scheduler-panel .btn-stop:hover:enabled { background: #eef3ee; }
+                #xunketang-autoplay-scheduler-panel .action-btn:disabled { cursor: default; opacity: .45; box-shadow: none; }
+                #xunketang-autoplay-scheduler-panel .log-section { border-top: 1px solid var(--line); margin-top: 19px; padding-top: 13px; }
+                #xunketang-autoplay-scheduler-panel .log-title { display: flex; align-items: center; justify-content: space-between; color: #607466; font-size: 11px; cursor: pointer; list-style: none; user-select: none; }
+                #xunketang-autoplay-scheduler-panel .log-title::-webkit-details-marker { display: none; }
+                #xunketang-autoplay-scheduler-panel .log-title svg { transition: transform .15s; }
+                #xunketang-autoplay-scheduler-panel details[open] .log-title svg { transform: rotate(180deg); }
+                #xunketang-autoplay-scheduler-panel #autoplay-log-container { max-height: 145px; overflow: auto; margin-top: 10px; padding: 9px 10px; border-radius: 8px; background: #eef2ed; scrollbar-width: thin; }
+                #xunketang-autoplay-scheduler-panel .log-entry { color: #5e7265; font-size: 10px; line-height: 1.7; padding: 4px 0; overflow-wrap: anywhere; border-bottom: 1px solid #dfe7dd; }
+                #xunketang-autoplay-scheduler-panel .log-entry:last-child { border: 0; }
+                #xunketang-autoplay-scheduler-panel .log-time { color: #7e9183; margin-right: 7px; font-variant-numeric: tabular-nums; }
+                #xunketang-autoplay-scheduler-panel .panel-footnote { margin-top: 14px; color: #89988c; font-size: 9px; text-align: center; letter-spacing: .2px; }
+                #xunketang-autoplay-scheduler-panel .minimized-icon { display: none; width: 54px; height: 54px; border: 0; color: #f4fff8; background: #193f35; place-items: center; }
+                #xunketang-autoplay-scheduler-panel.minimized { width: 56px; height: 56px; overflow: hidden; border-radius: 18px; }
+                #xunketang-autoplay-scheduler-panel.minimized .panel-content { display: none; }
+                #xunketang-autoplay-scheduler-panel.minimized .minimized-icon { display: grid; }
+                @media (max-width: 440px) { #xunketang-autoplay-scheduler-panel { right: 12px; top: 12px; max-height: calc(100vh - 24px); } }
+                @media (prefers-reduced-motion: reduce) { #xunketang-autoplay-scheduler-panel * { transition: none !important; } }
             </style>
-            <div class="minimized-icon">▶</div>
+            <button class="minimized-icon" aria-label="展开学习助手" title="展开学习助手">
+                <svg width="26" height="26" viewBox="0 0 24 24" fill="none"><path d="M9 5.5 18 12l-9 6.5v-13Z" fill="currentColor"/></svg>
+            </button>
             <div class="panel-content">
                 <div class="panel-header">
-                    <span class="panel-title">🎓 讯飞智课助手</span>
+                    <div class="brand-mark"><svg width="23" height="23" viewBox="0 0 24 24" fill="none"><path d="M3 5.5c3-1.3 6-1 9 1v14c-3-2-6-2.3-9-1V5.5Zm18 0c-3-1.3-6-1-9 1v14c3-2 6-2.3 9-1V5.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="m6 9 3 1m-3 3 3 1m6-4 3-1m-3 5 3-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></div>
+                    <div class="brand-copy"><div class="panel-title">讯飞智课助手</div><div class="panel-subtitle">让学习，有条不紊。</div></div>
                     <div class="panel-controls">
-                        <button class="panel-btn btn-minimize" title="最小化">−</button>
-                        <button class="panel-btn btn-close" title="关闭">×</button>
+                        <button class="panel-btn btn-minimize" aria-label="最小化" title="最小化">−</button>
+                        <button class="panel-btn btn-close" aria-label="关闭并停止" title="关闭并停止">×</button>
                     </div>
                 </div>
-                <div class="status-section">
-                    <div class="status-label">运行状态</div>
-                    <div class="status-value" id="autoplay-status">已停止</div>
-                </div>
-                <div class="progress-section">
-                    <div class="status-label">当前进度</div>
-                    <div class="progress-bar-container">
-                        <div class="progress-bar-fill" id="autoplay-progress-bar"></div>
+                <div class="panel-body">
+                    <div class="status-section"><span class="status-dot" id="autoplay-status-dot"></span><span class="status-value" id="autoplay-status" role="status" aria-live="polite">准备就绪，点击开始学习</span></div>
+                    <div class="resource-card">
+                        <div class="card-eyebrow"><span>当前资源</span><span class="type-tag" id="autoplay-resource-kind">待识别</span></div>
+                        <div class="resource-title" id="autoplay-resource-name">选择课程资源后，即可开始</div>
+                        <div class="progress-heading"><span>本节完成度</span><span class="progress-percent" id="autoplay-progress-percent">0%</span></div>
+                        <div class="progress-bar-container" role="progressbar" aria-label="本节完成度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><div class="progress-bar-fill" id="autoplay-progress-bar"></div></div>
+                        <div class="progress-info" id="autoplay-progress-text">等待课程信息</div>
                     </div>
-                    <div class="progress-info">
-                        <span id="autoplay-progress-text">等待开始...</span>
-                        <span id="autoplay-progress-percent">0%</span>
+                    <div class="stats">
+                        <div class="stat stat-complete"><span class="stat-number" id="autoplay-count-completed">0</span><span class="stat-label">已完成</span></div>
+                        <div class="stat stat-skip"><span class="stat-number" id="autoplay-count-skipped">0</span><span class="stat-label">已跳过</span></div>
+                        <div class="stat"><span class="stat-number" id="autoplay-count-total">0</span><span class="stat-label">本节资源</span></div>
                     </div>
-                </div>
-                <div class="button-section">
-                    <button class="action-btn btn-start" id="autoplay-start-btn">▶ 开始</button>
-                    <button class="action-btn btn-stop" id="autoplay-stop-btn" disabled>⏹ 停止</button>
-                </div>
-                <div class="log-section">
-                    <div class="log-title">📋 运行日志</div>
-                    <div id="autoplay-log-container"></div>
+                    <div class="button-section">
+                        <button class="action-btn btn-start" id="autoplay-start-btn"><svg width="13" height="13" viewBox="0 0 16 16"><path d="m4 2 9 6-9 6V2Z" fill="currentColor"/></svg>开始学习</button>
+                        <button class="action-btn btn-stop" id="autoplay-stop-btn" disabled><svg width="11" height="11" viewBox="0 0 12 12"><rect x="1" y="1" width="10" height="10" rx="2" fill="currentColor"/></svg>停止</button>
+                    </div>
+                    <details class="log-section"><summary class="log-title"><span>运行记录</span><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></summary><div id="autoplay-log-container" role="log" aria-live="off"></div></details>
+                    <div class="panel-footnote">以平台确认的学习进度为准</div>
                 </div>
             </div>
         `;
@@ -294,6 +217,13 @@
         startBtn = document.getElementById('autoplay-start-btn');
         stopBtn = document.getElementById('autoplay-stop-btn');
         logContainer = document.getElementById('autoplay-log-container');
+        resourceText = document.getElementById('autoplay-resource-name');
+        completedText = document.getElementById('autoplay-count-completed');
+        totalText = document.getElementById('autoplay-count-total');
+        skippedText = document.getElementById('autoplay-count-skipped');
+        kindText = document.getElementById('autoplay-resource-kind');
+        statusIndicator = document.getElementById('autoplay-status-dot');
+        panel.querySelectorAll('button').forEach(button => { button.type = 'button'; });
 
         // 绑定事件
         startBtn.addEventListener('click', startAutoplay);
@@ -310,46 +240,47 @@
     }
 
     function makeDraggable(element, handle) {
-        let isDragging = false;
-        let offsetX, offsetY;
-
-        handle.addEventListener('mousedown', (e) => {
-            isDragging = true;
-            offsetX = e.clientX - element.getBoundingClientRect().left;
-            offsetY = e.clientY - element.getBoundingClientRect().top;
-            element.style.transition = 'none';
+        let drag = null;
+        handle.addEventListener('pointerdown', event => {
+            if (event.button !== 0 || event.target.closest('button')) return;
+            const bounds = element.getBoundingClientRect();
+            drag = { x: event.clientX - bounds.left, y: event.clientY - bounds.top };
+            handle.setPointerCapture(event.pointerId);
+            handle.style.cursor = 'grabbing';
         });
-
-        document.addEventListener('mousemove', (e) => {
-            if (!isDragging) return;
-            const x = e.clientX - offsetX;
-            const y = e.clientY - offsetY;
-            element.style.left = x + 'px';
-            element.style.top = y + 'px';
+        handle.addEventListener('pointermove', event => {
+            if (!drag) return;
+            const left = Math.max(0, Math.min(window.innerWidth - element.offsetWidth, event.clientX - drag.x));
+            const top = Math.max(0, Math.min(window.innerHeight - element.offsetHeight, event.clientY - drag.y));
+            element.style.left = left + 'px';
+            element.style.top = top + 'px';
             element.style.right = 'auto';
         });
-
-        document.addEventListener('mouseup', () => {
-            isDragging = false;
-            element.style.transition = 'all 0.3s ease';
-        });
+        const finish = () => { drag = null; handle.style.cursor = 'grab'; };
+        handle.addEventListener('pointerup', finish);
+        handle.addEventListener('pointercancel', finish);
+        handle.addEventListener('lostpointercapture', finish);
     }
 
     function toggleMinimize() {
         controlPanel.classList.toggle('minimized');
     }
 
-    function updateStatus(text, color = '#fff') {
+    function updateStatus(text, color = '#537063') {
+        color = color === '#4ade80' ? '#16836a' : color === '#f87171' ? '#a1563d' : color;
         if (statusText) {
             statusText.textContent = text;
             statusText.style.color = color;
+            if (statusIndicator) statusIndicator.style.background = color;
         }
     }
 
     function updateProgress(text, percent = -1) {
         if (progressText) progressText.textContent = text;
         if (progressBar && percent >= 0) {
-            progressBar.style.width = Math.min(100, Math.max(0, percent)) + '%';
+            const value = Math.min(100, Math.max(0, percent));
+            progressBar.style.width = value + '%';
+            progressBar.parentElement?.setAttribute('aria-valuenow', String(Math.round(value)));
         }
         const percentEl = document.getElementById('autoplay-progress-percent');
         if (percentEl && percent >= 0) {
@@ -362,7 +293,11 @@
         const time = new Date().toLocaleTimeString('zh-CN', { hour12: false });
         const entry = document.createElement('div');
         entry.className = 'log-entry';
-        entry.innerHTML = `<span class="log-time">${time}</span>${message}`;
+        const stamp = document.createElement('span');
+        stamp.className = 'log-time';
+        stamp.textContent = time;
+        entry.appendChild(stamp);
+        entry.appendChild(document.createTextNode(String(message)));
         logContainer.appendChild(entry);
         logContainer.scrollTop = logContainer.scrollHeight;
 
@@ -370,64 +305,6 @@
         while (logContainer.children.length > 50) {
             logContainer.removeChild(logContainer.firstChild);
         }
-    }
-
-    // ========== 开始/停止控制 ==========
-    function startAutoplay() {
-        if (isRunning) return;
-        isRunning = true;
-        updateStatus('运行中', '#4ade80');
-        startBtn.disabled = true;
-        stopBtn.disabled = false;
-        addLog('🚀 自动播放已启动');
-
-        // 立即执行一次
-        checkAndProcess();
-
-        // 设置定时器
-        mainInterval = setInterval(checkAndProcess, CONFIG.checkInterval);
-
-        // PPT 单独用更快的节奏（一次点击可能只是走一步动画，需要连点）
-        pptInterval = setInterval(() => {
-            if (!isRunning || isProcessing) return;
-            if (getContentType() !== 'ppt') return;
-            handlePPT();
-        }, CONFIG.pptTickInterval);
-    }
-
-    function stopAutoplay() {
-        if (!isRunning) return;
-        isRunning = false;
-        updateStatus('已停止', '#f87171');
-        startBtn.disabled = false;
-        stopBtn.disabled = true;
-        addLog('⏹ 自动播放已停止');
-
-        if (mainInterval) {
-            clearInterval(mainInterval);
-            mainInterval = null;
-        }
-        if (pptInterval) {
-            clearInterval(pptInterval);
-            pptInterval = null;
-        }
-        resetPdfState();
-    }
-
-    // ========== 工具函数 ==========
-    function log(...args) {
-        if (CONFIG.debug) {
-            console.log(
-                '%c[讯飞刷课脚本]',
-                'color: #4CAF50; font-weight: bold;',
-                ...args
-            );
-        }
-        addLog(args.join(' '));
-    }
-
-    function sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
     }
 
     // ========== 页面元素查找 ==========
@@ -462,76 +339,28 @@
         return isNaN(value) ? null : value;
     }
 
-    // 被跳过的资源项（例如 PPT 播放器崩溃无法继续的），不再回头处理
-    function isItemSkipped(item) {
-        return !!(item && item.dataset && item.dataset.xkSkipped === '1');
-    }
-
-    // 获取下一个未完成的资源项
-    function getNextUnfinishedItem() {
-        const items = getResourceItems();
-        let foundActive = false;
-
-        for (const item of items) {
-            if (item.classList.contains('is-active')) {
-                foundActive = true;
-                continue;
-            }
-            // 找到当前项之后的未完成项
-            if (foundActive && !isItemCompleted(item) && !isItemSkipped(item)) {
-                return item;
-            }
-        }
-
-        // 如果当前项之后都完成了，找任何未完成的
-        for (const item of items) {
-            if (!isItemCompleted(item) && !isItemSkipped(item)) {
-                return item;
-            }
-        }
-
-        return null; // 所有都完成了
-    }
-
-    // 获取资源列表摘要（用于日志）
-    function getResourceSummary() {
-        const items = getResourceItems();
-        if (items.length === 0) return '无资源';
-
-        const summary = Array.from(items).map((item, i) => {
-            const isActive = item.classList.contains('is-active');
-            const completed = isItemCompleted(item);
-            const name = item.textContent?.trim().substring(0, 30) || '?';
-            let status = completed ? '✅' : '⏳';
-            if (isActive) status += '(当前)';
-            return `${i + 1}.${name} ${status}`;
-        });
-
-        return summary.join(' | ');
-    }
-
     // 查找"继续学习下一节"按钮
     function findNextSectionButton() {
         const buttons = document.querySelectorAll('button');
         for (const btn of buttons) {
             const text = btn.textContent.trim();
-            if (text.includes('继续学习下一节') || text.includes('下一节')) {
+            if (isActionable(btn) && (text.includes('继续学习下一节') || text === '下一节')) {
                 return btn;
             }
         }
         const gradientBtns = document.querySelectorAll('.el-button--gradient.btn-right');
         for (const btn of gradientBtns) {
-            if (btn.textContent.includes('下一节')) {
+            if (isActionable(btn) && btn.textContent.includes('下一节')) {
                 return btn;
             }
         }
         // 兜底：有些入口是 div/span 做的按钮，只在叶子节点上匹配短文本
         const nodes = document.querySelectorAll('div, span, a, [role="button"]');
         for (const el of nodes) {
-            if (el.children.length > 0) continue;
+            if (el.children.length > 0 || !isVisible(el) || el.closest('#xunketang-autoplay-scheduler-panel')) continue;
             const text = (el.textContent || '').trim();
-            if (text === '下一节' || text === '下一章'
-                || text === '继续学习下一节') {
+            if (isActionable(el) && (text === '下一节' || text === '下一章'
+                || text === '继续学习下一节')) {
                 return el;
             }
         }
@@ -540,7 +369,7 @@
 
     // 查找视频元素
     function findVideo() {
-        return document.querySelector('video');
+        return Array.from(document.querySelectorAll('video')).find(isVisible) || null;
     }
 
     // 查找播放按钮
@@ -566,9 +395,19 @@
     //   </div></div></div>
     // </div>
     function findPptRoot() {
-        return document.querySelector('.pptWrap')
+        return findOfficePptFrame()
+            || document.querySelector('.pptWrap')
             || document.querySelector('.pptContainer')
             || document.querySelector('#SlidePanel');
+    }
+
+    function findOfficePptFrame() {
+        return Array.from(document.querySelectorAll('iframe.officeweb365-iframe, iframe[src*="ow365.cn"]'))
+            .find(frame => {
+                try {
+                    return isVisible(frame) && officeOrigin(new URL(frame.src, location.href).origin);
+                } catch (error) { return false; }
+            }) || null;
     }
 
     // 获取上一页/下一页按钮
@@ -600,28 +439,6 @@
         return getPptButtons().next;
     }
 
-    // 判断当前内容类型
-    function getContentType() {
-        if (document.querySelector('video')) return 'video';
-        if (findPptRoot()) return 'ppt';
-        // 检测自适应练习页面（有"开始练习"按钮）
-        if (document.querySelector('button.el-button--gradient.el-button--large span')) {
-            const btnTexts = document.querySelectorAll('button.el-button--gradient.el-button--large span');
-            for (const span of btnTexts) {
-                if (span.textContent.trim() === '开始练习') return 'practice';
-            }
-        }
-        // 已经进入自适应练习页面（有"交卷"按钮）
-        if (findSubmitPracticeButton()) return 'practice';
-        // 已经交卷、正在等站点更新进度（页面这时候可能已经没有"交卷"按钮了）
-        if (practiceSubmitAt && Date.now() - practiceSubmitAt < CONFIG.practiceSubmitWait + 60000) {
-            return 'practice';
-        }
-        // PDF 资源（阅读器嵌在 iframe 里）
-        if (findPdfFrame()) return 'pdf';
-        return 'unknown';
-    }
-
     // 查找 PDF 阅读器 iframe
     function findPdfFrame() {
         return document.querySelector('iframe[src*="pdfv-resource"]')
@@ -632,7 +449,7 @@
     function findStartPracticeButton() {
         const btns = document.querySelectorAll('button.el-button--gradient.el-button--large');
         for (const btn of btns) {
-            if (btn.textContent.trim().includes('开始练习')) {
+            if (isActionable(btn) && btn.textContent.trim().includes('开始练习')) {
                 return btn;
             }
         }
@@ -645,36 +462,16 @@
         const quick = document.querySelectorAll('div.text, span.text, .el-button');
         for (const el of quick) {
             const text = (el.textContent || '').trim();
-            if (text === '交卷' || text === '提交' || text === '提交答案') return el;
+            if (isActionable(el) && (text === '交卷' || text === '提交' || text === '提交答案')) return el;
         }
         // 兜底：全页扫叶子节点（只取叶子，避免对大容器取 textContent）
         const nodes = document.querySelectorAll('button, [role="button"], div, span, a');
         for (const el of nodes) {
-            if (el.children.length > 0) continue;
+            if (el.children.length > 0 || !isVisible(el) || el.closest('#xunketang-autoplay-scheduler-panel')) continue;
             const text = (el.textContent || '').trim();
-            if (text === '交卷' || text === '提交' || text === '提交答案') return el;
+            if (isActionable(el) && (text === '交卷' || text === '提交' || text === '提交答案')) return el;
         }
         return null;
-    }
-
-    // 检测PPT是否已到最后一页
-    function isSlideAtEnd() {
-        // 新版播放器有明确页码，直接按页码判断（不会再把"控件隐藏"误判成最后一页）
-        const info = getSlideInfo();
-        if (info && info.total > 0) return info.current >= info.total;
-
-        // 老版没有页码可读时，沿用原来的判断方式
-        const nextBtn = findNextSlideButton();
-        if (!nextBtn) return true;
-        if (nextBtn.disabled || nextBtn.classList.contains('disabled')) return true;
-        const style = window.getComputedStyle(nextBtn);
-        if (style.display === 'none' || style.visibility === 'hidden') return true;
-        const navPanel = document.querySelector('#SlideshowNavigationPanel');
-        if (navPanel) {
-            const navStyle = window.getComputedStyle(navPanel);
-            if (navStyle.visibility === 'hidden') return true;
-        }
-        return false;
     }
 
     // 获取PPT页码信息
@@ -747,7 +544,7 @@
     function findPptCrashDialog() {
         const nodes = document.querySelectorAll('button, a, span, div, p, li');
         for (const el of nodes) {
-            if (el.children.length > 0) continue;
+            if (el.children.length > 0 || !isVisible(el) || el.closest('#xunketang-autoplay-scheduler-panel')) continue;
             const text = (el.textContent || '').trim();
             if (!text) continue;
             if (text === '重新启动') return el;
@@ -756,762 +553,919 @@
         return null;
     }
 
-    // 崩溃弹窗可能出现在 PPT 的 iframe 里，跨域读不到，所以由那个 iframe 的脚本
-    // 通过 postMessage 通知学习页；学习页自己检测到就直接处理
-    function watchPptViewerCrash() {
-        if (!CONFIG.skipResourceOnPptCrash) return;
-        let lastReportAt = 0;
-        setInterval(() => {
-            if (Date.now() - lastReportAt < 60000) return;
-            if (!findPptCrashDialog()) return;
-            lastReportAt = Date.now();
 
-            if (isStudyFrame) {
-                handlePptCrash();
+    // ========== 基础工具：等待都可取消，播放器 Promise 都有超时 ==========
+    function log(...args) {
+        if (CONFIG.debug) console.log('[讯飞调度优化版]', ...args);
+        addLog(args.join(' '));
+    }
+
+    function isVisible(el) {
+        return !!el && !el.closest('[hidden], [aria-hidden="true"]') && el.getClientRects().length > 0;
+    }
+
+    function isActionable(el) {
+        return isVisible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true'
+            && !el.classList.contains('disabled') && !el.classList.contains('is-disabled');
+    }
+
+    function aborted() {
+        return new DOMException('任务已取消', 'AbortError');
+    }
+
+    function waitForPromise(promise, signal, timeout) {
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) return reject(aborted());
+            let timer;
+            const finish = (error, value) => {
+                clearTimeout(timer);
+                signal.removeEventListener('abort', cancel);
+                if (error) reject(error);
+                else resolve(value);
+            };
+            const cancel = () => finish(aborted());
+            signal.addEventListener('abort', cancel, { once: true });
+            timer = setTimeout(() => finish(new Error('播放器响应超时')), timeout);
+            Promise.resolve(promise).then(value => finish(null, value), finish);
+        });
+    }
+
+    function sleep(ms, signal) {
+        return new Promise((resolve, reject) => {
+            if (signal.aborted) return reject(aborted());
+            const cancel = () => {
+                clearTimeout(timer);
+                reject(aborted());
+            };
+            const timer = setTimeout(() => {
+                signal.removeEventListener('abort', cancel);
+                resolve();
+            }, ms);
+            signal.addEventListener('abort', cancel, { once: true });
+        });
+    }
+
+    function pauseMedia(video) {
+        try { video?.pause(); } catch (error) { /* 播放器可能已被页面移除 */ }
+    }
+
+    function uniqueId() {
+        return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`;
+    }
+
+    // ========== 讯飞适配：所有资源身份、内容识别和导航入口集中在这里 ==========
+    const records = new Map();
+    const playOwners = new WeakMap();
+    const site = {
+        sectionKey: () => location.href,
+        isStudyPage: () => /\/pattern\/chapter|[?&#]chapterId=/i.test(location.href) || getResourceItems().length > 0,
+        items: () => Array.from(getResourceItems()),
+        active: getActiveResourceItem,
+        title(item) {
+            const title = item.querySelector('.activity-name, .activity-title, .title');
+            return (title?.textContent || item.textContent || '')
+                .replace(/已学\s*[\d.]+\s*%?/g, '').replace(/已完成|未完成/g, '')
+                .replace(/\s+/g, ' ').trim();
+        },
+        key(item) {
+            if (!item) return '';
+            const id = ['data-resource-id', 'data-activity-id', 'data-id', 'id']
+                .map(name => item.getAttribute(name)).find(Boolean);
+            // 老页面没有 ID 时，用章节 + 顺序 + 去掉进度的标题，避免进度更新导致身份变化。
+            return JSON.stringify([this.sectionKey(), id || [this.items().indexOf(item), this.title(item)]]);
+        },
+        record(item) {
+            const key = this.key(item);
+            if (!records.has(key)) records.set(key, { skipped: false, reason: '', pdfRestarts: 0, pdfReloads: 0 });
+            return records.get(key);
+        },
+        next() {
+            const items = this.items();
+            const index = items.indexOf(this.active());
+            const ordered = [...items.slice(index + 1), ...items.slice(0, index + 1)];
+            return ordered.find(item => !isItemCompleted(item) && !this.record(item).skipped) || null;
+        },
+        snapshot() {
+            const video = findVideo();
+            const pptRoot = findPptRoot();
+            const pdfFrame = findPdfFrame();
+            const ppt = isVisible(pptRoot) ? pptRoot : null;
+            const frame = isVisible(pdfFrame) ? pdfFrame : null;
+            const pptFrame = findOfficePptFrame() || document.querySelector('.pptIframe, iframe[src*="PowerPointFrame"]');
+            return { video, videoSrc: video?.currentSrc || video?.src || '', ppt,
+                pptFrame, pptSrc: pptFrame?.src || '', frame, pdfSrc: frame?.src || '' };
+        },
+        type(ctx) {
+            if (findVideo()) return 'video';
+            if (isVisible(findPptRoot())) return 'ppt';
+            if (isVisible(findPdfFrame())) return 'pdf';
+            if (findStartPracticeButton() || findSubmitPracticeButton() || (ctx && ctx.state.practice.submitAt !== null)) {
+                return ctx ? 'practice' : 'unknown';
+            }
+            return 'unknown';
+        },
+        counts() {
+            const items = this.items();
+            const completed = items.filter(isItemCompleted).length;
+            const skipped = items.filter(item => !isItemCompleted(item) && this.record(item).skipped).length;
+            return { total: items.length, completed, skipped };
+        },
+        clickResource: item => clickElement(item),
+        nextSection: findNextSectionButton,
+    };
+
+    function renderProgress(ctx) {
+        const { total, completed, skipped } = site.counts();
+        if (resourceText) resourceText.textContent = (ctx?.item || site.active()) ? site.title(ctx?.item || site.active()) : '选择课程资源后，即可开始';
+        if (completedText) completedText.textContent = completed;
+        if (totalText) totalText.textContent = total;
+        if (skippedText) skippedText.textContent = skipped;
+        if (kindText) kindText.textContent = { video: '视频', ppt: 'PPT', pdf: 'PDF', practice: '练习' }[ctx?.type] || '待识别';
+        let detail = '';
+        if (ctx?.type === 'video') {
+            const video = findVideo();
+            if (video && Number.isFinite(video.duration) && video.duration > 0) {
+                detail = ` | 视频 ${Math.round(video.currentTime / video.duration * 100)}%`;
+            }
+        } else if (ctx?.type === 'ppt') {
+            const page = ctx.office?.info || getSlideInfo();
+            if (page) {
+                detail = ` | PPT ${page.current}/${page.total}`;
+                if (page.animationTotal > 0) detail += ` · 动画 ${page.animationCurrent}/${page.animationTotal}`;
+            }
+        } else if (ctx?.type === 'pdf') detail = ' | PDF';
+        else if (ctx?.type === 'practice') detail = ' | 练习';
+        updateProgress(`已完成 ${completed}/${total} | 跳过 ${skipped}${detail}`, total ? completed / total * 100 : 0);
+    }
+
+    function createContext(item) {
+        return {
+            key: site.key(item), item, section: site.sectionKey(), token: uniqueId(),
+            controller: new AbortController(), createdAt: Date.now(), type: 'unknown',
+            signals: new Set(), bridge: null, snapshot: site.snapshot(),
+            state: {
+                video: { element: null, src: '', lastAttempt: -Infinity, lastLog: 0, endSince: null },
+                ppt: { signal: '', lastChange: Date.now(), lastClick: 0, lastPage: '', clicks: 0,
+                    retries: 0, retryAt: 0, noButton: 0, endSince: null, lastCrashCheck: 0 },
+                practice: { startAt: null, starts: 0, submitAt: null, confirmed: false },
+                pdf: { lastProgress: null, lastChange: Date.now(), endSince: null },
+            },
+        };
+    }
+
+    function isCurrent(run, ctx) {
+        return scheduler.run === run && isRunning && !run.controller.signal.aborted
+            && !ctx.controller.signal.aborted && site.sectionKey() === ctx.section
+            && site.key(site.active()) === ctx.key;
+    }
+
+    function assertCurrent(run, ctx) {
+        if (!isCurrent(run, ctx)) throw aborted();
+    }
+
+    function disposeContext(ctx) {
+        if (!ctx) return;
+        bridge.send(ctx, 'stop');
+        ctx.controller.abort();
+        pauseMedia(ctx.state.video.element);
+    }
+
+    // ========== iframe 消息桥：来源、当前窗口、资源会话、加载批次都必须一致 ==========
+    const CHANNEL = 'xunketang.scheduler.v1';
+    function trustedOrigin(origin) {
+        try {
+            const url = new URL(origin);
+            return /^https?:$/.test(url.protocol)
+                && /(^|\.)(fifedu\.com|xunketang\.com)$/.test(url.hostname);
+        } catch (error) { return false; }
+    }
+
+    const bridge = {
+        connect(ctx, frame, kind) {
+            if (!frame?.contentWindow) return;
+            const origin = new URL(frame.src, location.href).origin;
+            if (!trustedOrigin(origin)) return;
+            if (!ctx.bridge || ctx.bridge.frame !== frame || ctx.bridge.src !== frame.src) {
+                this.send(ctx, 'stop');
+                const link = { frame, window: frame.contentWindow, src: frame.src, origin,
+                    kind, nonce: uniqueId(), helperId: null };
+                ctx.bridge = link;
+                frame.addEventListener('load', () => {
+                    if (ctx.controller.signal.aborted || ctx.bridge !== link) return;
+                    // WindowProxy 在 iframe 重载后可能不变，因此每次 load 都更换批次编号。
+                    link.nonce = uniqueId();
+                    link.helperId = null;
+                    this.send(ctx, 'bind');
+                }, { signal: ctx.controller.signal });
+            }
+            this.send(ctx, 'bind');
+            this.send(ctx, 'start');
+        },
+        send(ctx, type) {
+            const link = ctx?.bridge;
+            if (!link) return;
+            try {
+                link.window.postMessage({ channel: CHANNEL, type, session: ctx.token,
+                    nonce: link.nonce, kind: link.kind }, link.origin);
+            } catch (error) { log(`阅读器消息发送失败：${error.message}`); }
+        },
+        receive(event) {
+            if (officePpt.receive(event)) return;
+            const run = scheduler.run;
+            const ctx = run?.context;
+            const data = event.data;
+            const link = ctx?.bridge;
+            if (!ctx || !link || !isCurrent(run, ctx) || !data || data.channel !== CHANNEL
+                || event.source !== link.window || event.origin !== link.origin
+                || data.session !== ctx.token || data.nonce !== link.nonce || data.kind !== link.kind) return;
+            if (data.type === 'ready' && typeof data.helperId === 'string') link.helperId = data.helperId;
+            else if (typeof link.helperId === 'string' && data.helperId === link.helperId
+                && ['ppt-crash', 'pdf-error', 'pdf-end'].includes(data.type)) {
+                if ((data.type === 'ppt-crash' && ctx.type !== 'ppt')
+                    || (data.type.startsWith('pdf-') && ctx.type !== 'pdf')) return;
+                ctx.signals.add(data.type);
+                scheduler.wake();
+            }
+        },
+    };
+
+    // ========== 资源处理器：只返回结果，不直接切换资源 ==========
+    // action：wait 继续等待；skip 请求跳过；reload 请求重载；blocked 停止并说明原因。
+    const result = (action = 'wait', reason = '', delay = CONFIG.checkInterval) => ({ action, reason, delay });
+
+    // OfficeWeb365 使用播放器本身的字符串消息协议，不向其发送自定义对象，
+    // 也不需要在 ow365.cn 上额外注入脚本。nextAnim 会先推进同页动画，再自然翻页。
+    function officeOrigin(origin) {
+        try {
+            const url = new URL(origin);
+            return /^https?:$/.test(url.protocol) && /(^|\.)ow365\.cn$/.test(url.hostname);
+        } catch (error) { return false; }
+    }
+
+    const officePpt = {
+        connect(ctx, frame) {
+            const origin = new URL(frame.src, location.href).origin;
+            if (!officeOrigin(origin) || !frame.contentWindow) return null;
+            if (!ctx.office || ctx.office.frame !== frame || ctx.office.src !== frame.src) {
+                const link = { frame, window: frame.contentWindow, origin, src: frame.src,
+                    info: null, receivedAt: null, requestedAt: null, connectedAt: Date.now(), pending: null };
+                ctx.office = link;
+                frame.addEventListener('load', () => {
+                    if (ctx.controller.signal.aborted || ctx.office !== link) return;
+                    link.info = null;
+                    link.pending = null;
+                    link.receivedAt = null;
+                    link.requestedAt = null;
+                    link.connectedAt = Date.now();
+                    scheduler.wake();
+                }, { signal: ctx.controller.signal });
+                log('📑 已识别 OfficeWeb365 PPT，正在读取页码与动画状态');
+            }
+            const link = ctx.office;
+            if (link.requestedAt === null || Date.now() - link.requestedAt >= CONFIG.checkInterval) {
+                this.send(ctx, 'pageAnim');
+            }
+            return link;
+        },
+        send(ctx, command) {
+            const link = ctx.office;
+            if (!link || ctx.controller.signal.aborted || !['pageAnim', 'nextAnim'].includes(command)) return;
+            if (command === 'pageAnim') link.requestedAt = Date.now();
+            link.window.postMessage(command, link.origin);
+        },
+        receive(event) {
+            const run = scheduler.run;
+            const ctx = run?.context;
+            const link = ctx?.office;
+            if (!ctx || ctx.type !== 'ppt' || !link || !isCurrent(run, ctx)
+                || event.source !== link.window || event.origin !== link.origin
+                || findOfficePptFrame() !== link.frame || link.frame.src !== link.src
+                || link.requestedAt === null) return false;
+            let data = event.data;
+            if (typeof data === 'string') {
+                if (data.length > 200000) return false;
+                try { data = JSON.parse(data); } catch (error) { return false; }
+            }
+            if (!data || data.info !== 'ow365' || !data.page || !data.anim) return false;
+            const number = value => typeof value === 'number' || (typeof value === 'string' && /^\d+$/.test(value.trim()))
+                ? Number(value) : NaN;
+            const info = { current: number(data.page.idx), total: number(data.page.total),
+                animationCurrent: number(data.anim.idx), animationTotal: number(data.anim.total) };
+            if (!Object.values(info).every(Number.isSafeInteger) || info.current < 1 || info.total < info.current
+                || info.total > 10000 || info.animationCurrent < 0 || info.animationTotal < info.animationCurrent
+                || info.animationTotal > 100000) return false;
+            // 播放器会回传自身 URL；只用于比对，不保存或输出带签名的资源地址。
+            if (data.url) {
+                try { if (new URL(data.url).href !== new URL(link.src).href) return false; }
+                catch (error) { return false; }
+            }
+            const signature = `${info.current}/${info.total}#${info.animationCurrent}/${info.animationTotal}`;
+            const previous = link.info;
+            const previousSignature = previous
+                ? `${previous.current}/${previous.total}#${previous.animationCurrent}/${previous.animationTotal}` : '';
+            link.info = info;
+            link.receivedAt = Date.now();
+            if (signature !== previousSignature) {
+                link.pending = null;
+                ctx.state.ppt.lastChange = Date.now();
+                ctx.state.ppt.retries = 0;
+                log(`📄 PPT ${info.current}/${info.total}，动画 ${info.animationCurrent}/${info.animationTotal}`);
+            }
+            scheduler.wake();
+            return true;
+        },
+    };
+
+    function processOfficePpt(run, ctx, frame) {
+        const state = ctx.state.ppt;
+        const link = officePpt.connect(ctx, frame);
+        const now = Date.now();
+        if (!link || !link.info) {
+            if (now - (link?.connectedAt ?? ctx.createdAt) >= CONFIG.resourceLoadTimeout) {
+                return result('blocked', 'OfficeWeb365 未返回页码，请等待播放器加载后重试');
+            }
+            return result('wait', '', CONFIG.pptTickInterval);
+        }
+        const page = link.info;
+        if (page.current >= page.total && page.animationCurrent >= page.animationTotal) {
+            if (state.endSince === null) {
+                state.endSince = now;
+                log('⏳ PPT 最后一页及动画已结束，等待站点确认进度');
+            }
+            return now - state.endSince >= CONFIG.progressConfirmWait
+                ? result('blocked', 'PPT 已阅读到末尾，但站点未确认完成') : result();
+        }
+        state.endSince = null;
+        if (state.clicks >= CONFIG.maxSlideClicks) return result('blocked', 'PPT 操作次数已达上限，请手动检查');
+        if (now - link.receivedAt >= CONFIG.slideStuckTimeout) {
+            return result('blocked', 'OfficeWeb365 状态通知中断，请检查播放器是否正常');
+        }
+        const stuck = now - state.lastChange >= CONFIG.slideStuckTimeout;
+        if (stuck && state.retries >= CONFIG.pptRetryLimit) {
+            return result('blocked', 'PPT 多次推进仍无变化，请手动检查');
+        }
+        if (stuck && now < state.retryAt) return result('wait', '', CONFIG.pptTickInterval);
+        if (!stuck && link.pending) return result('wait', '', CONFIG.pptTickInterval);
+        const pageKey = `${page.current}/${page.total}`;
+        const delay = pageKey !== state.lastPage ? CONFIG.slideIntervalPage : CONFIG.slideIntervalAnim;
+        if (now - state.lastClick < delay) return result('wait', '', CONFIG.pptTickInterval);
+        if (stuck) {
+            state.retries++;
+            state.retryAt = now + CONFIG.slideRetryInterval;
+            log(`🔁 PPT 未推进，重试 ${state.retries}/${CONFIG.pptRetryLimit}`);
+        }
+        state.lastClick = now;
+        state.lastPage = pageKey;
+        state.clicks++;
+        link.pending = { sentAt: now };
+        officePpt.send(ctx, 'nextAnim');
+        return result('wait', '', CONFIG.pptTickInterval);
+    }
+
+    async function processVideo(run, ctx) {
+        const video = findVideo();
+        if (!video) return result();
+        const state = ctx.state.video;
+        const src = video.currentSrc || video.src;
+        if (state.element !== video || state.src !== src) {
+            state.element = video;
+            state.src = src;
+            state.lastAttempt = -Infinity;
+            state.endSince = null;
+            log(`🎬 处理视频：${site.title(ctx.item)}`);
+        }
+        if (CONFIG.autoMute) video.muted = true;
+        if (video.playbackRate !== CONFIG.playbackRate) video.playbackRate = CONFIG.playbackRate;
+        if (video.ended) {
+            if (state.endSince === null) state.endSince = Date.now();
+            if (Date.now() - state.endSince >= CONFIG.progressConfirmWait) {
+                return result('blocked', '视频已结束，但站点未确认完成，请检查进度后重新开始');
+            }
+            return result();
+        }
+        state.endSince = null;
+        if (video.paused && Date.now() - state.lastAttempt >= CONFIG.videoRetryInterval) {
+            state.lastAttempt = Date.now();
+            assertCurrent(run, ctx);
+            const button = findPlayButton();
+            if (isActionable(button)) {
+                button.click();
+                await sleep(500, ctx.controller.signal);
+                assertCurrent(run, ctx);
+            }
+            if (findVideo() !== video || (video.currentSrc || video.src) !== src) return result();
+            if (video.paused) {
+                playOwners.set(video, ctx.token);
+                // play() 无法真正取消；迟到的完成回调只允许清理自己拥有的播放器。
+                const promise = Promise.resolve(video.play());
+                promise.then(() => {
+                    const stale = !isCurrent(run, ctx) || findVideo() !== video
+                        || (video.currentSrc || video.src) !== src;
+                    if (stale && playOwners.get(video) === ctx.token) pauseMedia(video);
+                }, () => {});
+                try { await waitForPromise(promise, ctx.controller.signal, CONFIG.mediaPlayTimeout); }
+                catch (error) {
+                    if (error.name === 'AbortError') throw error;
+                    assertCurrent(run, ctx);
+                    log(`⚠️ 视频暂时无法播放：${error.message}，稍后重试`);
+                }
+                assertCurrent(run, ctx);
+            }
+        }
+        if (Date.now() - state.lastLog >= 30000) {
+            state.lastLog = Date.now();
+            log(`📊 视频状态：${video.paused ? '暂停' : '播放中'}，站点进度 ${getItemProgress(ctx.item) ?? '未知'}%`);
+        }
+        return result();
+    }
+
+    function processPpt(run, ctx) {
+        const officeFrame = findOfficePptFrame();
+        if (officeFrame) return processOfficePpt(run, ctx, officeFrame);
+        const state = ctx.state.ppt;
+        const now = Date.now();
+        const frame = document.querySelector('.pptIframe, iframe[src*="PowerPointFrame"]');
+        bridge.connect(ctx, frame, 'ppt');
+        if (CONFIG.skipResourceOnPptCrash) {
+            if (ctx.signals.delete('ppt-crash')) return result('skip', 'PPT 播放器崩溃');
+            if (now - state.lastCrashCheck >= 10000) {
+                state.lastCrashCheck = now;
+                if (findPptCrashDialog()) return result('skip', 'PPT 播放器崩溃');
+            }
+        }
+        const page = getSlideInfo();
+        const pageKey = page ? `${page.current}/${page.total}` : '';
+        const progress = getItemProgress(ctx.item);
+        const signal = `${pageKey}#${progress}`;
+        if (signal !== state.signal) {
+            state.signal = signal;
+            state.lastChange = now;
+            state.retries = 0;
+        }
+        const next = findNextSlideButton();
+        const newViewer = !!document.querySelector('.pptWrap, .pptContainer');
+        state.noButton = !newViewer && !page && !next ? state.noButton + 1 : 0;
+        const atEnd = (page && page.total > 0 && page.current >= page.total)
+            || (next && (next.disabled || next.classList.contains('disabled'))) || state.noButton >= 3;
+        if (atEnd) {
+            if (state.endSince === null) {
+                state.endSince = now;
+                log('⏳ PPT 到达末尾，等待站点确认进度');
+            }
+            if (now - state.endSince >= CONFIG.progressConfirmWait) {
+                return result('blocked', 'PPT 到达末尾，但站点未确认完成，请检查进度');
+            }
+            return result();
+        }
+        state.endSince = null;
+        // 点击和方向键共享同一个上限，卡住分支也不能绕过保险丝。
+        if (state.clicks >= CONFIG.maxSlideClicks) return result('blocked', 'PPT 操作次数已达上限，请手动检查');
+        if (now - state.lastChange >= CONFIG.slideStuckTimeout) {
+            if (state.retries >= CONFIG.pptRetryLimit) return result('blocked', 'PPT 多次恢复仍无变化，请手动检查');
+            if (now >= state.retryAt) {
+                state.retries++;
+                state.clicks++;
+                state.retryAt = now + CONFIG.slideRetryInterval;
+                pressSlideNextKey();
+                log(`🔁 PPT 卡住，方向键恢复 ${state.retries}/${CONFIG.pptRetryLimit}`);
+            }
+            return result('wait', '', CONFIG.pptTickInterval);
+        }
+        const advanced = !!pageKey && pageKey !== state.lastPage;
+        const delay = advanced ? CONFIG.slideIntervalPage : CONFIG.slideIntervalAnim;
+        if (now - state.lastClick >= delay) {
+            state.lastClick = now;
+            state.lastPage = pageKey;
+            state.clicks++;
+            if (next) clickElement(next);
+            else pressSlideNextKey();
+        }
+        return result('wait', '', CONFIG.pptTickInterval);
+    }
+
+    function confirmPractice(ctx) {
+        const state = ctx.state.practice;
+        if (state.confirmed) return;
+        for (const box of document.querySelectorAll('.el-message-box, .el-dialog')) {
+            if (!isVisible(box) || !/交卷|提交|作答|确定要|确认要/.test(box.textContent || '')) continue;
+            for (const button of box.querySelectorAll('button')) {
+                if (isActionable(button) && /^(确定|确认|继续|交卷)$/.test(button.textContent.trim())) {
+                    button.click();
+                    state.confirmed = true;
+                    log('✅ 已确认交卷，等待站点更新进度');
+                    return;
+                }
+            }
+        }
+    }
+
+    function processPractice(run, ctx) {
+        const state = ctx.state.practice;
+        const now = Date.now();
+        // 一旦发起交卷，固定等待起点，不因按钮仍在页面上而不断重新计时。
+        if (state.submitAt !== null) {
+            confirmPractice(ctx);
+            if (now - state.submitAt >= CONFIG.practiceSubmitWait) {
+                return result(CONFIG.skipPracticeIfNotMarked ? 'skip' : 'blocked', '练习已发起交卷，但站点未确认完成');
+            }
+            return result();
+        }
+        const start = findStartPracticeButton();
+        if (start) {
+            if (state.startAt === null || now - state.startAt >= 5000) {
+                if (state.starts >= 3) return result('blocked', '练习入口多次点击仍未打开');
+                state.starts++;
+                state.startAt = now;
+                start.click();
+                log('📝 已点击开始练习');
+            }
+            return result();
+        }
+        const submit = findSubmitPracticeButton();
+        if (submit) {
+            state.submitAt = now;
+            submit.click();
+            log('📝 已发起交卷');
+        } else if (now - ctx.createdAt >= CONFIG.resourceLoadTimeout) {
+            return result('blocked', '练习页面未出现可用操作，请手动检查');
+        }
+        return result();
+    }
+
+    function processPdf(run, ctx) {
+        const state = ctx.state.pdf;
+        const record = site.record(ctx.item);
+        bridge.connect(ctx, findPdfFrame(), 'pdf');
+        const now = Date.now();
+        if (ctx.signals.delete('pdf-end') && state.endSince === null) {
+            state.endSince = now;
+            log('⏳ PDF 阅读器已到末尾，等待站点确认进度');
+        }
+        if (state.endSince !== null && now - state.endSince >= CONFIG.progressConfirmWait) {
+            return result('blocked', 'PDF 已到末尾，但站点未确认完成');
+        }
+        if (state.endSince !== null && !ctx.signals.has('pdf-error')) return result();
+        const progress = getItemProgress(ctx.item);
+        if (progress !== state.lastProgress) {
+            state.lastProgress = progress;
+            state.lastChange = now;
+        }
+        if (ctx.signals.delete('pdf-error')) {
+            if (record.pdfReloads >= 2) return result('blocked', 'PDF 多次重载仍未渲染出内容');
+            record.pdfReloads++;
+            return result('reload', `PDF 未渲染出内容，重载 ${record.pdfReloads}/2`);
+        }
+        if (now - state.lastChange < CONFIG.pdfStuckTimeout) return result();
+        state.lastChange = now;
+        if (record.pdfRestarts < 5) {
+            record.pdfRestarts++;
+            state.endSince = null;
+            bridge.send(ctx, 'restart');
+            log(`🔁 PDF 进度停滞，从头阅读 ${record.pdfRestarts}/5`);
+        } else if (record.pdfReloads < 2) {
+            record.pdfReloads++;
+            return result('reload', `PDF 进度停滞，重载 ${record.pdfReloads}/2`);
+        } else return result('blocked', 'PDF 恢复次数已达上限，请手动检查');
+        return result();
+    }
+
+    const handlers = { video: processVideo, ppt: processPpt, pdf: processPdf, practice: processPractice };
+
+    // ========== 调度器：唯一决定资源切换的位置，同一轮绝不并行执行 ==========
+    const scheduler = {
+        run: null,
+        start() {
+            if (isRunning) return;
+            const run = { controller: new AbortController(), context: null, timer: null,
+                due: Infinity, busy: false, pending: false, navigation: null,
+                section: site.sectionKey(), emptySince: null, lastSectionClick: -Infinity };
+            this.run = run;
+            isRunning = true;
+            if (startBtn) startBtn.disabled = true;
+            if (stopBtn) stopBtn.disabled = false;
+            updateStatus('运行中', '#4ade80');
+            log('🚀 调度器已启动');
+            this.wake();
+        },
+        stop(reason = '已停止') {
+            const run = this.run;
+            if (!run) return;
+            this.run = null;
+            isRunning = false;
+            clearTimeout(run.timer);
+            run.controller.abort();
+            run.navigation?.controller.abort();
+            disposeContext(run.context);
+            pauseMedia(findVideo());
+            if (startBtn) startBtn.disabled = false;
+            if (stopBtn) stopBtn.disabled = true;
+            updateStatus(reason, reason === '已停止' ? '#76847e' : '#f87171');
+            log(`⏹ ${reason}`);
+        },
+        wake(delay = 0) {
+            const run = this.run;
+            if (!run || !isRunning) return;
+            if (run.busy) { run.pending = true; return; }
+            const due = Date.now() + delay;
+            if (run.timer !== null && run.due <= due) return;
+            clearTimeout(run.timer);
+            run.due = due;
+            run.timer = setTimeout(() => {
+                run.timer = null;
+                run.due = Infinity;
+                void this.pump(run);
+            }, delay);
+        },
+        async pump(run) {
+            if (this.run !== run || !isRunning || run.busy) return;
+            run.busy = true;
+            run.pending = false;
+            let delay = CONFIG.checkInterval;
+            try { delay = await this.tick(run); }
+            catch (error) {
+                if (error.name !== 'AbortError' && this.run === run) {
+                    this.stop(`发生错误：${error.message}`);
+                    console.error('[讯飞调度优化版]', error);
+                }
+            } finally {
+                run.busy = false;
+                if (this.run === run && isRunning) this.wake(run.pending ? 0 : delay);
+            }
+        },
+        pageChanged() {
+            const run = this.run;
+            if (!run) return;
+            if (run.context && !isCurrent(run, run.context)) run.context.controller.abort();
+            this.wake();
+        },
+        navigate(run, item, reason = '', reload = false, manual = false) {
+            const previous = run.context?.snapshot || site.snapshot();
+            disposeContext(run.context);
+            run.context = null;
+            run.navigation?.controller.abort();
+            const target = item || site.nextSection();
+            if (!target) {
+                const counts = site.counts();
+                renderProgress(null);
+                this.stop(`本节已完成 ${counts.completed}/${counts.total}，跳过 ${counts.skipped}；未找到下一节`);
                 return;
             }
-            console.warn('[讯飞刷课脚本] 检测到 PPT 播放器崩溃弹窗，通知学习页跳过该资源');
-            try {
-                window.top.postMessage({
-                    type: 'xk-ppt-crash',
-                    href: location.href,
-                }, '*');
-            } catch (e) { /* ignore */ }
-        }, 10000);
-    }
-
-    // 检测到 PPT 播放器崩溃：把当前资源标记为跳过，直接切到下一个
-    function handlePptCrash() {
-        const now = Date.now();
-        if (now - lastCrashHandledAt < 15000) return;
-
-        const activeItem = getActiveResourceItem();
-        if (!activeItem) return;
-        // 已经切到视频上了，说明是旧 iframe 的滞后通知，忽略
-        if (getContentType() === 'video') return;
-        lastCrashHandledAt = now;
-
-        activeItem.dataset.xkSkipped = '1';
-        const name = (activeItem.textContent || '').trim().substring(0, 40);
-        log(`⏭ PPT播放器崩溃，跳过该资源: ${name}`);
-
-        resetPPTState();
-        goToNextResource();
-    }
-
-    // 关闭弹窗
-    function dismissDialogs() {
-        // 交卷确认框不能被自己关掉，等它处理完再恢复
-        if (Date.now() < suppressDismissUntil) return;
-        const closeBtns = document.querySelectorAll(
-            '.el-dialog__headerbtn, .el-message-box__headerbtn, .el-notification__closeBtn'
-        );
-        closeBtns.forEach(btn => {
-            if (btn.offsetParent !== null) btn.click();
-        });
-    }
-
-    // ========== 视频处理 ==========
-
-    let currentVideoSrc = '';
-
-    async function initVideoPlayer() {
-        const video = findVideo();
-        if (!video) return false;
-
-        if (video.src === currentVideoSrc && !video.paused) return true;
-
-        const isNewVideo = video.src !== currentVideoSrc;
-        currentVideoSrc = video.src;
-
-        // 设置播放参数
-        if (CONFIG.autoMute && !video.muted) {
-            video.muted = true;
-        }
-        if (video.playbackRate !== CONFIG.playbackRate) {
-            video.playbackRate = CONFIG.playbackRate;
-        }
-
-        // 自动播放
-        if (video.paused) {
-            try {
-                const playBtn = findPlayButton();
-                if (playBtn) playBtn.click();
-                await sleep(500);
-                if (video.paused) await video.play();
-            } catch (e) {
-                video.muted = true;
-                try { await video.play(); } catch (e2) { /* ignore */ }
-            }
-        }
-
-        if (isNewVideo) {
-            log(`🎬 新视频已加载, 时长: ${video.duration?.toFixed(0) || '加载中'}s, 速率: ${video.playbackRate}x`);
-        }
-        return true;
-    }
-
-    // ========== PPT处理 ==========
-
-    let pptLastSignal = '';
-    let pptLastChangeAt = 0;
-    let pptLastClickAt = 0;
-    let pptLastClickPageKey = '';
-    let pptClickCount = 0;
-    let pptKeyTried = false;
-    let pptNotified = false;
-    let pptRetryAt = 0;
-    let pptNoButtonCount = 0;
-    // 最近一次因 PPT 崩溃而跳过资源的时间
-    let lastCrashHandledAt = 0;
-    // 自适应练习状态
-    let practiceSubmitAt = 0;
-    let practiceWaitLogged = false;
-    // 交卷弹确认框期间，临时禁止自动关框
-    let suppressDismissUntil = 0;
-
-    // 以"站点保存的进度"为准：新播放器的 .page 数字会和真实状态不同步，不能作为唯一依据
-    async function handlePPT() {
-        const now = Date.now();
-        const activeItem = getActiveResourceItem();
-        // 已被标记跳过的资源（例如播放器崩溃），不再翻页
-        if (activeItem && isItemSkipped(activeItem)) return false;
-        const progress = activeItem ? getItemProgress(activeItem) : null;
-        const slideInfo = getSlideInfo();
-        const slideKey = slideInfo ? `${slideInfo.current}/${slideInfo.total}` : '';
-        const nextSlideBtn = findNextSlideButton();
-
-        // 页码或进度任一变化，都说明这一轮有推进
-        const signal = `${slideKey || '?'}#${progress === null ? '?' : progress}`;
-        if (signal !== pptLastSignal) {
-            pptLastSignal = signal;
-            pptLastChangeAt = now;
-            pptKeyTried = false;
-        }
-
-        // 1) 站点进度达标 → 完成
-        if (progress !== null && progress >= CONFIG.progressRequired) {
-            if (!pptNotified) {
-                pptNotified = true;
-                log(`✅ PPT已完成，站点进度 ${progress}%`);
-            }
-            return true;
-        }
-
-        // 2) 页码已经到最后一页 → 等站点进度更新即可，不再翻页
-        if (slideInfo && slideInfo.total > 0 && slideInfo.current >= slideInfo.total) {
-            if (!pptNotified) {
-                pptNotified = true;
-                log(`✅ PPT已翻到最后一页 (${slideKey})，等待进度更新`);
-            }
-            return false;
-        }
-
-        // 3) 翻页按钮已禁用 → 同上
-        if (nextSlideBtn && (nextSlideBtn.disabled || nextSlideBtn.classList.contains('disabled'))) {
-            if (!pptNotified) {
-                pptNotified = true;
-                log(`✅ PPT翻页按钮已禁用 (${slideKey || '未知'})，等待进度更新`);
-            }
-            return false;
-        }
-
-        // 4) 老版播放器（#SlidePanel）：读不到页码且按钮消失 → 视为结束
-        //    新版播放器有 .pptWrap，不走这个规则，避免按钮加载间隙被误判为结束
-        const newViewer = !!document.querySelector('.pptWrap, .pptContainer');
-        if (!newViewer && !slideInfo && !nextSlideBtn) {
-            pptNoButtonCount++;
-            if (pptNoButtonCount >= 3) {
-                log('✅ PPT已翻到最后一页（翻页按钮已消失）');
-                return true;
-            }
-            return false;
-        }
-        pptNoButtonCount = 0;
-
-        // 5) 长时间没有推进
-        const stuckFor = now - pptLastChangeAt;
-        if (stuckFor > CONFIG.slideStuckTimeout) {
-            if (!pptKeyTried) {
-                pptKeyTried = true;
-                log(`⚠️ PPT ${Math.round(stuckFor / 1000)}秒没有变化（当前 ${slideKey || '未知'}，进度 ${progress === null ? '未知' : progress + '%'}），改用方向键尝试`);
-                pressSlideNextKey();
-                return false;
-            }
-            if (now < pptRetryAt) return false;
-            pptRetryAt = now + CONFIG.slideRetryInterval;
-            log(`🔁 PPT仍未推进（当前 ${slideKey || '未知'}），${Math.round(CONFIG.slideRetryInterval / 1000)}秒后重试`);
-            pressSlideNextKey();
-            return false;
-        }
-
-        // 6) 按间隔翻页
-        //    - 页码和上次点击时一样：说明这一下只是走了同页动画，隔得短一点继续点
-        //    - 页码变了：说明真翻页了，多等一会儿让画面渲染完
-        const pageAdvancedSinceClick = !!slideKey && slideKey !== pptLastClickPageKey;
-
-        // 保险丝：单个PPT点击次数异常多时彻底停下，避免把浏览器拖死
-        if (pptClickCount >= CONFIG.maxSlideClicks) {
-            if (!pptNotified) {
-                pptNotified = true;
-                log(`⛔ PPT点击次数已达上限（${pptClickCount} 次），停止翻页，请手动检查`);
-            }
-            return false;
-        }
-
-        const clickDelay = pageAdvancedSinceClick
-            ? CONFIG.slideIntervalPage
-            : CONFIG.slideIntervalAnim;
-        if (now - pptLastClickAt < clickDelay) return false;
-        pptLastClickAt = now;
-        pptLastClickPageKey = slideKey;
-        pptClickCount++;
-        if (pageAdvancedSinceClick) {
-            log(`📄 [PPT] 翻页, 当前: ${slideKey || '未知'}，进度 ${progress === null ? '未知' : progress + '%'}`);
-        } else if (pptClickCount % 5 === 1) {
-            log(`▸ [PPT] 点击推进同页动画, 当前: ${slideKey || '未知'}`);
-        }
-        if (nextSlideBtn) clickElement(nextSlideBtn);
-        else pressSlideNextKey();
-        return false;
-    }
-
-    function resetPPTState() {
-        pptLastSignal = '';
-        pptLastChangeAt = 0;
-        pptLastClickAt = 0;
-        pptLastClickPageKey = '';
-        pptClickCount = 0;
-        pptKeyTried = false;
-        pptNotified = false;
-        pptRetryAt = 0;
-        pptNoButtonCount = 0;
-    }
-
-    // ========== 自适应练习处理 ==========
-
-    function resetPracticeState() {
-        practiceSubmitAt = 0;
-        practiceWaitLogged = false;
-    }
-
-    // 点"交卷"之后可能弹出 Element UI 确认框，这里替用户点"确定"
-    function confirmPracticeSubmit() {
-        if (!practiceSubmitAt || Date.now() - practiceSubmitAt > 30000) return false;
-        const boxes = document.querySelectorAll('.el-message-box, .el-dialog');
-        for (const box of boxes) {
-            if (box.offsetParent === null) continue;
-            if (!/交卷|提交|作答|确定要|确认要/.test(box.textContent || '')) continue;
-            const btns = box.querySelectorAll('button');
-            for (const btn of btns) {
-                const text = (btn.textContent || '').trim();
-                if (text === '确定' || text === '确认' || text === '继续' || text === '交卷') {
-                    clickElement(btn);
-                    log('✅ 已确认交卷');
-                    return true;
-                }
-            }
-        }
-        return false;
-    }
-
-    async function handlePractice() {
-        // 1) 还没进入练习：点"开始练习"
-        const startBtn = findStartPracticeButton();
-        if (startBtn) {
-            log('📝 检测到自适应练习，点击"开始练习"...');
-            clickElement(startBtn);
-            await sleep(3000);
-            return false;
-        }
-
-        const activeItem = getActiveResourceItem();
-
-        // 2) 已进入练习页：点"交卷"
-        const submitBtn = findSubmitPracticeButton();
-        if (submitBtn) {
-            // 刚点过就等一等，先处理确认框
-            if (practiceSubmitAt && Date.now() - practiceSubmitAt < 30000) {
-                confirmPracticeSubmit();
-                return false;
-            }
-            practiceSubmitAt = Date.now();
-            practiceWaitLogged = false;
-            suppressDismissUntil = practiceSubmitAt + 30000;
-            log('📝 自适应练习：点击"交卷"');
-            clickElement(submitBtn);
-            return false;
-        }
-
-        // 3) 交卷之后：确认框兜底 + 等站点把资源标记为完成
-        if (!practiceSubmitAt) return false;
-        confirmPracticeSubmit();
-
-        const waited = Date.now() - practiceSubmitAt;
-        if (activeItem && isItemCompleted(activeItem)) return true;
-
-        if (waited > 10000 && !practiceWaitLogged) {
-            practiceWaitLogged = true;
-            log('⏳ 练习已交卷，等待站点更新进度...');
-        }
-
-        if (waited > CONFIG.practiceSubmitWait) {
-            if (CONFIG.skipPracticeIfNotMarked && activeItem && !isItemSkipped(activeItem)) {
-                activeItem.dataset.xkSkipped = '1';
-                log(`⏭ 练习已交卷但站点未更新进度（等待 ${Math.round(waited / 1000)} 秒），跳过该资源`);
-                resetPracticeState();
-                goToNextResource();
-            }
-        }
-        return false;
-    }
-
-    // ========== PDF 处理 ==========
-    // PDF 阅读器是跨域 iframe，主页面读不到里面的 DOM，
-    // 所以由主页面发消息，iframe 里的脚本实例负责滚动
-
-    let pdfSignaledFrame = null;
-    let pdfLastProgress = null;
-    let pdfLastProgressAt = 0;
-    let pdfRestartCount = 0;
-    let pdfLastRestartAt = 0;
-    let pdfReloadCount = 0;
-    let pdfLastReloadAt = 0;
-
-    function signalPdfFrame(type) {
-        const frame = findPdfFrame();
-        if (!frame || !frame.contentWindow) return;
-        try {
-            frame.contentWindow.postMessage({ type: type }, '*');
-        } catch (e) { /* ignore */ }
-    }
-
-    async function handlePdf() {
-        const frame = findPdfFrame();
-        if (!frame) return false;
-
-        const item = getActiveResourceItem();
-        const progress = item ? getItemProgress(item) : null;
-
-        if (pdfSignaledFrame !== frame) {
-            pdfSignaledFrame = frame;
-            pdfLastProgress = progress;
-            pdfLastProgressAt = Date.now();
-            log('📕 检测到 PDF 资源，已通知内置阅读器自动翻页');
-        }
-        // 每隔一轮重发一次，避免阅读器比脚本晚加载导致漏掉指令
-        signalPdfFrame('xk-pdf-start');
-
-        // 进度变了就重新计时
-        if (progress !== pdfLastProgress) {
-            pdfLastProgress = progress;
-            pdfLastProgressAt = Date.now();
-            return false;
-        }
-
-        // 进度长时间不动：先让阅读器从头再滚一遍，还不行就重新加载这个资源
-        const stuckFor = Date.now() - pdfLastProgressAt;
-        if (stuckFor < CONFIG.pdfStuckTimeout) return false;
-
-        const now = Date.now();
-        if (pdfRestartCount < 5 && now - pdfLastRestartAt > 30000) {
-            pdfLastRestartAt = now;
-            pdfRestartCount++;
-            pdfLastProgressAt = now;
-            const pct = progress === null ? '未知' : progress + '%';
-            log(`⚠️ PDF 进度 ${Math.round(stuckFor / 1000)} 秒没变化（当前 ${pct}），让阅读器从头再滚一遍`);
-            signalPdfFrame('xk-pdf-restart');
-            return false;
-        }
-
-        if (pdfReloadCount < 2 && now - pdfLastReloadAt > 60000) {
-            pdfLastReloadAt = now;
-            pdfReloadCount++;
-            pdfLastProgressAt = now;
-            log('⚠️ PDF 仍未推进，重新点一次该资源，让阅读器重新加载');
-            if (item) clickElement(item);
-        }
-        return false;
-    }
-
-    function resetPdfState() {
-        signalPdfFrame('xk-pdf-stop');
-        pdfSignaledFrame = null;
-        pdfLastProgress = null;
-        pdfLastProgressAt = 0;
-        pdfRestartCount = 0;
-        pdfLastRestartAt = 0;
-        pdfReloadCount = 0;
-        pdfLastReloadAt = 0;
-    }
-
-    // 阅读器自己报告"加载不出内容"：重新点一次该资源让它重载
-    let pdfErrorHandledAt = 0;
-    function handlePdfError() {
-        const now = Date.now();
-        if (now - pdfErrorHandledAt < 60000) return;
-        pdfErrorHandledAt = now;
-        log('⚠️ PDF 阅读器没有渲染出内容，重新点一次该资源让它重新加载');
-        const item = getActiveResourceItem();
-        if (item) clickElement(item);
-    }
-
-    // ========== 主控制逻辑 ==========
-
-    let isProcessing = false;
-    let lastProgressTime = 0;
-
-    // 更新进度显示
-    function updateProgressDisplay() {
-        const items = getResourceItems();
-        if (items.length === 0) {
-            updateProgress('无资源', 0);
-            return;
-        }
-
-        const completedCount = Array.from(items).filter(item => isItemCompleted(item)).length;
-        const percent = (completedCount / items.length) * 100;
-        const activeItem = getActiveResourceItem();
-        const contentType = getContentType();
-
-        let statusInfo = '';
-        if (contentType === 'video') {
-            const video = findVideo();
-            if (video && video.duration) {
-                const videoPct = ((video.currentTime / video.duration) * 100).toFixed(1);
-                const remaining = (video.duration - video.currentTime).toFixed(0);
-                statusInfo = ` | 视频: ${videoPct}% (${remaining}s)`;
-            }
-        } else if (contentType === 'ppt') {
-            const slideInfo = getSlideInfo();
-            if (slideInfo) {
-                statusInfo = ` | PPT: ${slideInfo.current}/${slideInfo.total}`;
-            }
-        } else if (contentType === 'practice') {
-            statusInfo = ' | 练习中';
-        } else if (contentType === 'pdf') {
-            const item = getActiveResourceItem();
-            const pct = item ? getItemProgress(item) : null;
-            statusInfo = pct === null ? ' | PDF' : ` | PDF: 已学 ${pct}%`;
-        }
-
-        updateProgress(`已完成 ${completedCount}/${items.length}${statusInfo}`, percent);
-    }
-
-    // 切到下一个未完成资源；本节都没有了就去下一节
-    let emptySectionSince = 0;
-    let lastNextSectionClickAt = 0;
-
-    // 本节没有资源时，直接尝试进入下一节
-    async function goToNextSection() {
-        if (isProcessing) return false;
-
-        // 只在章节学习页做这件事，避免在入口页/课程列表页乱点
-        const onStudyPage = /\/pattern\/chapter|chapterId=/i.test(location.href);
-        if (!onStudyPage) return false;
-
-        const now = Date.now();
-        if (now - lastNextSectionClickAt < CONFIG.emptySectionCooldown) return false;
-        lastNextSectionClickAt = now;
-
-        const nextSectionBtn = findNextSectionButton();
-        if (!nextSectionBtn) {
-            log('⚠️ 本节没有资源，也没找到"下一节"按钮，需要手动切换章节');
-            return false;
-        }
-
-        isProcessing = true;
-        try {
-            log('⏭ 本节没有资源，点击"下一节"');
-            resetPPTState();
-            resetPracticeState();
-            resetPdfState();
-            currentVideoSrc = '';
-            clickElement(nextSectionBtn);
-            await sleep(CONFIG.switchWait);
-        } finally {
-            isProcessing = false;
-        }
-        return true;
-    }
-
-    async function goToNextResource() {
-        if (isProcessing) return false;
-        isProcessing = true;
-        try {
-            log(`资源状态: ${getResourceSummary()}`);
-
-            const nextItem = getNextUnfinishedItem();
-            if (nextItem) {
-                const name = nextItem.textContent?.trim().substring(0, 40) || '未知';
-                log(`👉 切换到下一个内容: ${name}`);
-                resetPPTState();
-                resetPracticeState();
-                resetPdfState();
-                currentVideoSrc = '';
-                nextItem.click();
-                await sleep(CONFIG.switchWait);
-                // 新内容加载后初始化
-                await initVideoPlayer();
-                return true;
-            }
-
-            // 本节所有内容都完成了（或被跳过），尝试跳到下一节
-            log('🎉 本节所有内容已完成!');
-            updateStatus('已完成', '#4ade80');
-
-            const nextSectionBtn = findNextSectionButton();
-            if (nextSectionBtn) {
-                log('✅ 点击"继续学习下一节"');
-                resetPPTState();
-                resetPracticeState();
-                resetPdfState();
-                currentVideoSrc = '';
-                nextSectionBtn.click();
-                await sleep(CONFIG.switchWait);
-                await initVideoPlayer();
-                return true;
-            }
-
-            log('⚠️ 未找到"下一节"按钮，所有任务可能已完成');
-            updateProgress('所有任务已完成!', 100);
-            stopAutoplay();
-            return false;
-        } finally {
-            isProcessing = false;
-        }
-    }
-
-    async function checkAndProcess() {
-        if (isProcessing) return;
-
-        // 更新进度显示
-        updateProgressDisplay();
-
-        dismissDialogs();
-
-        // 检查当前活跃资源项是否已完成
-        const activeItem = getActiveResourceItem();
-
-        // 本节一个资源都没有：等一会儿确认不是还没加载出来，然后直接进下一节
-        if (getResourceItems().length === 0) {
-            if (!emptySectionSince) emptySectionSince = Date.now();
-            if (Date.now() - emptySectionSince > CONFIG.emptySectionWait) {
-                await goToNextSection();
-            }
-            return;
-        }
-        emptySectionSince = 0;
-
-        // 被跳过的资源（例如 PPT 播放器崩溃）直接略过
-        if (activeItem && isItemSkipped(activeItem)) {
-            await goToNextResource();
-            return;
-        }
-
-        if (activeItem && isItemCompleted(activeItem)) {
-            // 当前内容已完成，尝试切换到下一个
-            log('当前内容已完成，查找下一个未完成的内容...');
-            await goToNextResource();
-            return;
-        }
-
-        // 当前内容未完成，根据类型处理
-        const contentType = getContentType();
-
-        if (contentType === 'video') {
-            await initVideoPlayer();
-            const video = findVideo();
-            if (video) {
-                // 检查是否卡住
-                if (video.paused && video.readyState >= 3 && !video.ended) {
-                    const now = Date.now();
-                    if (now - lastProgressTime > 15000) {
-                        log('视频暂停中，尝试恢复播放...');
-                        lastProgressTime = now;
+            const now = Date.now();
+            const navigation = { key: item ? site.key(item) : null, section: site.sectionKey(),
+                list: site.items().map(entry => site.key(entry)).join('|'), previous,
+                readyAt: now + CONFIG.switchWait, expiresAt: now + Math.max(CONFIG.switchTimeout, CONFIG.switchWait + 1000),
+                reload, loaded: new Set(), controller: new AbortController() };
+            run.navigation = navigation;
+            for (const frame of [previous.frame, previous.pptFrame].filter(Boolean)) {
+                frame.addEventListener('load', () => {
+                    if (this.run === run && run.navigation === navigation) {
+                        navigation.loaded.add(frame);
+                        this.wake();
                     }
-                    try {
-                        const playBtn = findPlayButton();
-                        if (playBtn) playBtn.click();
-                        else await video.play();
-                    } catch (e) { /* ignore */ }
+                }, { once: true, signal: navigation.controller.signal });
+            }
+            updateStatus('正在切换资源…');
+            if (!manual) {
+                log(`👉 ${reason || (item ? `切换资源：${site.title(item)}` : '进入下一节')}`);
+                if (item) site.clickResource(target);
+                else { run.lastSectionClick = now; clickElement(target); }
+            }
+        },
+        navigationReady(run) {
+            const nav = run.navigation;
+            const now = Date.now();
+            const active = site.active();
+            const view = site.snapshot();
+            let changed;
+            if (nav.key) {
+                changed = site.key(active) === nav.key;
+            } else {
+                changed = site.sectionKey() !== nav.section
+                    || site.items().map(entry => site.key(entry)).join('|') !== nav.list;
+            }
+            // 列表先变、播放器后变时，禁止操作残留的旧内容（包括跨章节切换）。
+            if (view.video && view.video === nav.previous.video && view.videoSrc === nav.previous.videoSrc) changed = false;
+            if (view.frame && view.frame === nav.previous.frame && !nav.loaded.has(view.frame)) changed = false;
+            if (!view.video && view.ppt && view.ppt === nav.previous.ppt && view.pptFrame
+                && view.pptFrame === nav.previous.pptFrame && !nav.loaded.has(view.pptFrame)) changed = false;
+            if (now >= nav.readyAt && changed) {
+                nav.controller.abort();
+                run.navigation = null;
+                run.emptySince = null;
+                return true;
+            }
+            if (now >= nav.expiresAt) this.stop('资源切换未确认，请检查页面后重新开始');
+            return false;
+        },
+        async tick(run) {
+            if (this.run !== run || !isRunning) return CONFIG.checkInterval;
+            if (run.navigation && !this.navigationReady(run)) return CONFIG.pptTickInterval;
+            if (site.sectionKey() !== run.section) {
+                if (run.context && site.isStudyPage() && site.active()) {
+                    this.navigate(run, site.active(), '', false, true);
+                    run.section = site.sectionKey();
+                    return CONFIG.pptTickInterval;
                 }
-
-                // 更新视频进度
-                const now = Date.now();
-                if (!video.paused && video.duration) {
-                    const pct = ((video.currentTime / video.duration) * 100).toFixed(1);
-                    const remaining = (video.duration - video.currentTime).toFixed(0);
-                    updateProgress(`视频播放中: ${pct}% | 剩余 ${remaining}s`, (video.currentTime / video.duration) * 100);
-                    
-                    // 定期输出日志
-                    if (now - lastProgressTime > 30000) {
-                        log(`📊 [视频] ${pct}% | 剩余 ${remaining}s`);
-                        lastProgressTime = now;
-                    }
-                }
+                disposeContext(run.context);
+                run.context = null;
+                run.section = site.sectionKey();
+                run.emptySince = null;
             }
-        } else if (contentType === 'ppt') {
-            await handlePPT();
-        } else if (contentType === 'pdf') {
-            await handlePdf();
-        } else if (contentType === 'practice') {
-            isProcessing = true;
-            try {
-                await handlePractice();
-            } finally {
-                isProcessing = false;
+            if (!site.isStudyPage()) {
+                updateStatus('等待进入章节学习页');
+                return CONFIG.checkInterval;
             }
-        }
-    }
-
-    // ========== 启动 ==========
-
-    async function start() {
-        isStudyFrame = true;
-        // 创建悬浮窗
-        createControlPanel();
-        
-        log('========================================');
-        log('  讯飞智课自动刷课脚本 v3.4 已加载');
-        log(`  播放速率: ${CONFIG.playbackRate}x`);
-        log(`  自动静音: ${CONFIG.autoMute ? '是' : '否'}`);
-        log('========================================');
-
-        await sleep(1000);
-
-        // PowerPoint Online 崩溃自救（播放器在 iframe 里，主页面也要帮忙盯着）
-        watchPptViewerCrash();
-
-        // 接收子 iframe 的通知：PPT 播放器崩溃 / PDF 阅读器加载失败
-        window.addEventListener('message', (e) => {
-            const data = e.data;
-            if (!data || typeof data.type !== 'string') return;
-            if (data.type === 'xk-ppt-crash') handlePptCrash();
-            else if (data.type === 'xk-pdf-error') handlePdfError();
-        });
-
-        // 显示当前资源状态
-        log(`📋 当前资源: ${getResourceSummary()}`);
-        updateProgressDisplay();
-
-        // 监听视频ended事件
-        document.addEventListener('ended', async (e) => {
-            if (e.target.tagName === 'VIDEO' && isRunning) {
-                log('视频播放结束事件触发');
-                await sleep(1000);
-                await checkAndProcess();
+            const items = site.items();
+            const item = site.active();
+            if (!items.length) {
+                disposeContext(run.context);
+                run.context = null;
+                renderProgress(null);
+                if (run.emptySince === null) run.emptySince = Date.now();
+                if (Date.now() - run.emptySince >= CONFIG.emptySectionWait
+                    && Date.now() - run.lastSectionClick >= CONFIG.emptySectionCooldown) this.navigate(run, null);
+                return CONFIG.checkInterval;
             }
-        });
-
-        // 监听页面变化（SPA动态加载）
-        let observerLastRun = 0;
-        const observer = new MutationObserver(async () => {
-            if (!isRunning) return;
-            // 页面变动很频繁，节流一下，别让回调跟着一直跑
-            if (Date.now() - observerLastRun < 1000) return;
-            observerLastRun = Date.now();
-            const video = findVideo();
-            if (video && video.src !== currentVideoSrc) {
-                log('检测到视频源变化，重新初始化');
-                currentVideoSrc = '';
-                await sleep(2000);
-                await initVideoPlayer();
+            run.emptySince = null;
+            if (!item) {
+                if (site.next()) this.navigate(run, site.next());
+                else this.navigate(run, null);
+                return CONFIG.checkInterval;
             }
-        });
-        observer.observe(document.body, { childList: true, subtree: true });
+            if (run.context && run.context.key !== site.key(item)) {
+                this.navigate(run, item, '', false, true);
+                return CONFIG.pptTickInterval;
+            }
+            if (!run.context || run.context.controller.signal.aborted) run.context = createContext(item);
+            const ctx = run.context;
+            ctx.item = item; // DOM 重建但资源 ID 不变时，保留该资源的处理状态。
+            if (isItemCompleted(item) || site.record(item).skipped) {
+                this.navigate(run, site.next());
+                return CONFIG.checkInterval;
+            }
+            ctx.type = site.type(ctx);
+            ctx.snapshot = site.snapshot();
+            updateStatus({ video: '正在播放视频', ppt: '正在阅读 PPT', pdf: '正在阅读 PDF',
+                practice: '正在处理练习', unknown: '等待课程内容加载' }[ctx.type], '#4ade80');
+            renderProgress(ctx);
+            // 只关闭通知，不再一律关闭业务对话框，以免取消交卷或登录提示。
+            for (const button of document.querySelectorAll('.el-notification__closeBtn')) {
+                if (isActionable(button)) button.click();
+            }
+            const handler = handlers[ctx.type];
+            const outcome = handler ? await handler(run, ctx)
+                : Date.now() - ctx.createdAt >= CONFIG.resourceLoadTimeout
+                    ? result('blocked', '资源类型无法识别，请手动检查') : result();
+            assertCurrent(run, ctx);
+            if (outcome.action === 'skip') {
+                Object.assign(site.record(item), { skipped: true, reason: outcome.reason });
+                log(`⏭ 跳过：${site.title(item)}；${outcome.reason}`);
+                this.navigate(run, site.next());
+            } else if (outcome.action === 'reload') {
+                // 同 URL 的 iframe 重载用 load 事件确认，次数保存在资源记录而非新上下文中。
+                this.navigate(run, item, outcome.reason, true);
+            } else if (outcome.action === 'blocked') this.stop(outcome.reason);
+            return outcome.delay;
+        },
+    };
 
-        log('脚本加载完成，点击"开始"按钮启动自动播放');
-    }
+    function startAutoplay() { scheduler.start(); }
+    function stopAutoplay() { scheduler.stop(); }
 
-    // ========== PDF 阅读器（在 iframe 内部运行） ==========
-
-    // 判断当前 iframe 是不是 PDF 阅读器
-    function isPdfViewerFrame() {
-        if (/pdfv-resource|viewer\.html/i.test(location.href)) return true;
-        return !!document.getElementById('viewerContainer');
-    }
-
-    // 阅读器自己滚动翻页，主页面只负责发开始/停止指令
-    function runPdfViewerHelper() {
+    // ========== 阅读器辅助实例：只接受当前顶层页面绑定的会话 ==========
+    function runViewerHelper(kind) {
+        const helperId = uniqueId();
+        let binding = null;
         let enabled = false;
-        let lastScrollAt = 0;
         let reachedEnd = false;
-        let startedAt = 0;
+        let startedAt = null;
+        let lastAction = 0;
         let errorReported = false;
-
-        function getBox() {
-            return document.getElementById('viewerContainer')
-                || document.scrollingElement;
-        }
-
-        window.addEventListener('message', (e) => {
-            const data = e.data;
-            if (!data || typeof data.type !== 'string') return;
-            if (data.type === 'xk-pdf-start') {
-                if (reachedEnd) return;
-                if (!enabled) console.log('[讯飞刷课脚本] PDF阅读器：开始自动翻页');
-                enabled = true;
-                if (!startedAt) startedAt = Date.now();
-            } else if (data.type === 'xk-pdf-restart') {
-                const box = getBox();
-                if (box) box.scrollTop = 0;
-                reachedEnd = false;
-                enabled = true;
-                console.log('[讯飞刷课脚本] PDF阅读器：从头再滚一遍');
-            } else if (data.type === 'xk-pdf-stop') {
-                enabled = false;
+        let crashReported = false;
+        const send = type => {
+            if (!binding) return;
+            window.top.postMessage({ channel: CHANNEL, kind, type, helperId,
+                session: binding.session, nonce: binding.nonce }, binding.origin);
+        };
+        const reset = () => {
+            reachedEnd = false;
+            startedAt = null;
+            lastAction = 0;
+            errorReported = false;
+            crashReported = false;
+        };
+        const receive = event => {
+            const data = event.data;
+            if (event.source !== window.top || !trustedOrigin(event.origin) || !data
+                || data.channel !== CHANNEL || data.kind !== kind
+                || typeof data.session !== 'string' || typeof data.nonce !== 'string') return;
+            if (data.type === 'bind') {
+                if (!binding || binding.session !== data.session || binding.nonce !== data.nonce) {
+                    reset();
+                    enabled = false;
+                    binding = { origin: event.origin, session: data.session, nonce: data.nonce };
+                }
+                send('ready');
+                return;
             }
-        });
-
-        setInterval(() => {
+            if (!binding || event.origin !== binding.origin || data.session !== binding.session || data.nonce !== binding.nonce) return;
+            if (data.type === 'stop') enabled = false;
+            else if (data.type === 'restart') {
+                reset();
+                const box = document.getElementById('viewerContainer') || document.scrollingElement;
+                if (box) box.scrollTop = 0;
+                const app = window.PDFViewerApplication;
+                if (app?.pdfViewer) app.pdfViewer.currentPageNumber = 1;
+                enabled = true;
+                startedAt = Date.now();
+            } else if (data.type === 'start' && !reachedEnd) {
+                enabled = true;
+                if (startedAt === null) startedAt = Date.now();
+            }
+        };
+        window.addEventListener('message', receive);
+        const timer = setInterval(() => {
             if (!enabled) return;
-            const box = getBox();
-            if (!box) return;
-
-            // 页面一直没有渲染出任何一页，多半是阅读器加载失败，通知主页面
-            if (!errorReported && startedAt
-                && Date.now() - startedAt > 20000
+            const now = Date.now();
+            if (kind === 'ppt') {
+                if (CONFIG.skipResourceOnPptCrash && !crashReported && findPptCrashDialog()) {
+                    crashReported = true;
+                    send('ppt-crash');
+                }
+                return;
+            }
+            if (!errorReported && startedAt !== null && now - startedAt >= 20000
                 && document.querySelectorAll('.page').length === 0) {
                 errorReported = true;
-                console.warn('[讯飞刷课脚本] PDF阅读器：20 秒内没有渲染出任何页面');
-                try {
-                    window.top.postMessage({ type: 'xk-pdf-error' }, '*');
-                } catch (e) { /* ignore */ }
+                send('pdf-error');
             }
-
-            // 到底了就不再滚
-            if (box.scrollTop + box.clientHeight >= box.scrollHeight - 4) {
-                if (!reachedEnd) {
-                    reachedEnd = true;
-                    enabled = false;
-                    console.log('[讯飞刷课脚本] PDF阅读器：已读到最后一页');
+            const box = document.getElementById('viewerContainer') || document.scrollingElement;
+            if (!box || !box.clientHeight || document.querySelectorAll('.page').length === 0
+                || now - lastAction < CONFIG.pdfScrollInterval) return;
+            lastAction = now;
+            const app = window.PDFViewerApplication;
+            const current = Number(app?.pdfViewer?.currentPageNumber || document.getElementById('pageNumber')?.value);
+            const total = Number(app?.pagesCount || document.getElementById('numPages')?.textContent?.replace(/[^\d]/g, ''));
+            const bottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 4;
+            if (bottom) {
+                const next = document.getElementById('next');
+                // 单页模式滚动到底也可能还有下一页，先尝试阅读器的翻页入口。
+                if ((!total || !current || current < total) && isActionable(next)) {
+                    next.click();
+                    return;
                 }
+                if (total && current && current < total) return;
+                reachedEnd = true;
+                enabled = false;
+                send('pdf-end');
                 return;
             }
-
-            const now = Date.now();
-            if (now - lastScrollAt < CONFIG.pdfScrollInterval) return;
-            lastScrollAt = now;
-            const step = Math.max(200, box.clientHeight * CONFIG.pdfScrollStep);
             const before = box.scrollTop;
-            box.scrollTop = before + step;
-            // 容器滚不动（可能是单页模式），改用阅读器自带的"下一页"按钮
+            box.scrollTop += Math.max(200, box.clientHeight * CONFIG.pdfScrollStep);
             if (box.scrollTop === before) {
                 const next = document.getElementById('next');
-                if (next) next.click();
+                if (isActionable(next)) next.click();
             }
-        }, 500);
+        }, kind === 'ppt' ? 5000 : 500);
+        window.addEventListener('pagehide', () => {
+            enabled = false;
+            clearInterval(timer);
+            window.removeEventListener('message', receive);
+        }, { once: true });
     }
 
-    if (window.top === window.self) {
-        // 顶层页面负责全部刷课逻辑
-        start();
-    } else if (isPdfViewerFrame()) {
-        // PDF 阅读器：自己滚动翻页
-        runPdfViewerHelper();
-    } else {
-        // 其它子 iframe 里只保留 PPT 崩溃检测，不再各跑一份逻辑
-        watchPptViewerCrash();
+    // ========== 启动：事件只唤醒调度器，统一在 tick 中执行操作 ==========
+    function boot() {
+        if (window.top !== window.self) {
+            if (/pdfv-resource|viewer\.html/i.test(location.href) || document.getElementById('viewerContainer')) {
+                runViewerHelper('pdf');
+            } else if (/PowerPointFrame|owas\.fifedu\.com/i.test(location.href)) runViewerHelper('ppt');
+            return;
+        }
+        createControlPanel();
+        log('讯飞智课调度优化版 v4.0.1 已加载，请点击开始');
+        renderProgress(null);
+        window.addEventListener('message', event => bridge.receive(event));
+        // ended 不冒泡，使用捕获阶段监听。
+        document.addEventListener('ended', event => {
+            if (event.target?.tagName === 'VIDEO') scheduler.wake();
+        }, true);
+        let lastObserved = 0;
+        const observer = new MutationObserver(mutations => {
+            const relevant = mutations.some(change => !controlPanel?.contains(change.target));
+            if (!relevant || !isRunning || Date.now() - lastObserved < 300) return;
+            lastObserved = Date.now();
+            scheduler.pageChanged();
+        });
+        observer.observe(document.body, { childList: true, subtree: true,
+            attributes: true, attributeFilter: ['src', 'class'], characterData: true });
+        window.addEventListener('hashchange', () => scheduler.pageChanged());
+        window.addEventListener('popstate', () => scheduler.pageChanged());
+        window.addEventListener('pagehide', () => {
+            scheduler.stop('页面已离开');
+            observer.disconnect();
+        }, { once: true });
     }
+
+    boot();
 })();
