@@ -122,7 +122,6 @@
                 }
                 #xunketang-autoplay-scheduler-panel .brand-copy { flex: 1; min-width: 0; }
                 #xunketang-autoplay-scheduler-panel .panel-title { font-size: 16px; font-weight: 650; letter-spacing: .5px; }
-                #xunketang-autoplay-scheduler-panel .panel-subtitle { margin-top: 3px; color: #b4cfc2; font-size: 10px; letter-spacing: .8px; }
                 #xunketang-autoplay-scheduler-panel .panel-controls { display: flex; gap: 5px; align-self: flex-start; }
                 #xunketang-autoplay-scheduler-panel .panel-btn {
                     display: grid; place-items: center; width: 25px; height: 25px; border: 0;
@@ -165,7 +164,6 @@
                 #xunketang-autoplay-scheduler-panel .log-entry { color: #5e7265; font-size: 10px; line-height: 1.7; padding: 4px 0; overflow-wrap: anywhere; border-bottom: 1px solid #dfe7dd; }
                 #xunketang-autoplay-scheduler-panel .log-entry:last-child { border: 0; }
                 #xunketang-autoplay-scheduler-panel .log-time { color: #7e9183; margin-right: 7px; font-variant-numeric: tabular-nums; }
-                #xunketang-autoplay-scheduler-panel .panel-footnote { margin-top: 14px; color: #89988c; font-size: 9px; text-align: center; letter-spacing: .2px; }
                 #xunketang-autoplay-scheduler-panel .minimized-icon { display: none; width: 54px; height: 54px; border: 0; color: #f4fff8; background: #193f35; place-items: center; }
                 #xunketang-autoplay-scheduler-panel.minimized { width: 56px; height: 56px; overflow: hidden; border-radius: 18px; }
                 #xunketang-autoplay-scheduler-panel.minimized .panel-content { display: none; }
@@ -179,7 +177,7 @@
             <div class="panel-content">
                 <div class="panel-header">
                     <div class="brand-mark"><svg width="23" height="23" viewBox="0 0 24 24" fill="none"><path d="M3 5.5c3-1.3 6-1 9 1v14c-3-2-6-2.3-9-1V5.5Zm18 0c-3-1.3-6-1-9 1v14c3-2 6-2.3 9-1V5.5Z" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="m6 9 3 1m-3 3 3 1m6-4 3-1m-3 5 3-1" stroke="currentColor" stroke-width="1.2" stroke-linecap="round"/></svg></div>
-                    <div class="brand-copy"><div class="panel-title">讯飞智课助手</div><div class="panel-subtitle">让学习，有条不紊。</div></div>
+                    <div class="brand-copy"><div class="panel-title">讯飞智课助手</div></div>
                     <div class="panel-controls">
                         <button class="panel-btn btn-minimize" aria-label="最小化" title="最小化">−</button>
                         <button class="panel-btn btn-close" aria-label="关闭并停止" title="关闭并停止">×</button>
@@ -204,7 +202,6 @@
                         <button class="action-btn btn-stop" id="autoplay-stop-btn" disabled><svg width="11" height="11" viewBox="0 0 12 12"><rect x="1" y="1" width="10" height="10" rx="2" fill="currentColor"/></svg>停止</button>
                     </div>
                     <details class="log-section"><summary class="log-title"><span>运行记录</span><svg width="13" height="13" viewBox="0 0 16 16" fill="none"><path d="m4 6 4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg></summary><div id="autoplay-log-container" role="log" aria-live="off"></div></details>
-                    <div class="panel-footnote">以平台确认的学习进度为准</div>
                 </div>
             </div>
         `;
